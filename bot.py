@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 # --- الإعدادات ---
 TOKEN = '8705243157:AAEvgDT3PecE8fmwc962NnToHnJl2xpFhAQ'
-CASHIER_ID = 5312266808
+CASHIER_ID = 7447129659
 
 # رابط الداتا بيز السحابية بنجيبه من إعدادات Render
 DATABASE_URL = os.environ.get('DATABASE_URL')
