@@ -13,7 +13,7 @@ DB_NAME = 'orders_v2.db'
 
 # --- إعدادات السيرفر والـ Webhook (مهم جداً للتعديل) ---
 # حط الدومين تبعك هان (لازم يكون بيبدأ بـ https)
-WEBHOOK_DOMAIN = "https://lego-food-bot.onrender.com"
+WEBHOOK_DOMAIN = "https://your-bot-domain.onrender.com"
 # البورت اللي حنستخدمه
 PORT = int(os.environ.get('PORT', 8443)) 
 
@@ -214,7 +214,7 @@ async def receive_debt_receipt(update: Update, context: ContextTypes.DEFAULT_TYP
     elif update.message.document: await context.bot.send_document(chat_id=CASHIER_ID, document=update.message.document.file_id, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# --- التحديث المهم: تصفير الدين بدون تأخير (سريع جداً للـ Webhook) ---
+# --- التحديث المهم: تصفير الدين بدون تأخير باستخدام edit_message_caption ---
 async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -226,10 +226,11 @@ async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("UPDATE orders SET is_paid=1 WHERE user_id=? AND is_paid=0", (user_id,))
     conn.commit(); conn.close()
     
-    # 2. التواصل مع تيليجرام فوراً (شيلنا الـ 3 ثواني لأن الـ Webhook طلقة)
+    # 2. التواصل مع تيليجرام
     try:
-        await query.edit_message_text("✅ تم تصفير حساب المكتب بنجاح في قاعدة البيانات.")
-        await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك. شكراً لك!")
+        # التعديل هان: استخدمنا edit_message_caption لأن الرسالة تحتوي على صورة أو ملف (إشعار الدفع)
+        await query.edit_message_caption(caption="✅ تم تصفير حساب المكتب بنجاح في قاعدة البيانات.")
+        await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك. شكراً لك! 🌸")
         await context.bot.send_message(chat_id=CASHIER_ID, text="تم إرسال رسالة التصفير للزبون بنجاح. ✉️")
     except Exception as e:
         logging.error(f"Error sending clear debt message: {e}")
