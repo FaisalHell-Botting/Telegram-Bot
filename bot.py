@@ -130,7 +130,57 @@ async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ------------------------------------------------------------------
-# 2. نظام تعديل الطلب (تغيير الـ Logic ليعمل مع ConversationHandler)
+# 2. ميزة دفع فاتورة فورية (تحديث النص بناءً على طلب حاتم)
+# ------------------------------------------------------------------
+async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "كم قيمة الفاتورة اللي حابب تدفعها؟ هذه المعلومة مهمة للحسابات داخليا. اكتب الرقم مثلا (15)"
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]]))
+    return PAY_AMOUNT
+
+async def get_pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount_val = update.message.text
+    context.user_data['pay_amount'] = amount_val
+    text = f"تمام. ارفع الإشعار بعد اذنك بالمبلغ ({amount_val})."
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]]))
+    return PAY_RECEIPT
+
+async def get_pay_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user; amt = int(context.user_data.get('pay_amount', 0))
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (%s, %s, %s, %s, %s, %s, %s)", (user.id, "فاتورة فورية", amt, "دفع فوري", datetime.now().strftime("%Y-%m-%d %H:%M"), "مقبول", 1))
+    conn.commit(); conn.close()
+    await update.message.reply_text("شكراً لك! تم التسجيل بنجاح. 🌸")
+    await context.bot.send_photo(chat_id=CASHIER_ID, photo=update.message.photo[-1].file_id, caption=f"💰 فاتورة فورية: {amt} ش")
+    return ConversationHandler.END
+
+# ------------------------------------------------------------------
+# 3. تعديل صفحة "ديوني" (تنسيق حاتم الجديد)
+# ------------------------------------------------------------------
+async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT id, timestamp, total_price, details FROM orders WHERE user_id=%s AND is_paid=0 ORDER BY id DESC", (user_id,))
+    rows = c.fetchall(); conn.close()
+    
+    if not rows: 
+        return await update.message.reply_text("سجلك نظيف! ما عليك أي ديون حالياً. ✨")
+    
+    grand_total = sum(r[2] for r in rows)
+    
+    report = f"🔴 **قيمة الديون المتراكمة: {grand_total} شيكل**\n"
+    report += "⎯" * 15 + "\n\n"
+    
+    for r in rows:
+        # تنسيق التاريخ ليظهر اليوم والوقت بشكل أبسط
+        dt_str = r[1] # "2026-04-22 19:10"
+        report += f"📅 {dt_str} | 💰 {r[2]} ش\n"
+        report += f"📦 {r[3]}\n"
+        report += "⎯" * 10 + "\n"
+        
+    await update.message.reply_text(report)
+
+# ------------------------------------------------------------------
+# 4. معالجة الحالات المتقدمة (صنف ناقص، تعديل)
 # ------------------------------------------------------------------
 async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data.split("_")
@@ -157,57 +207,26 @@ async def remove_item_from_order(update: Update, context: ContextTypes.DEFAULT_T
     new_details = ", ".join(items); new_total = sum(PRICES.get(it, 0) for it in items)
     c.execute("UPDATE orders SET details=%s, total_price=%s, status='تعديل زبون' WHERE id=%s", (new_details, new_total, order_id))
     conn.commit(); conn.close()
-    await query.edit_message_text(f"⚠️ تم إبلاغ الزبون بنقص ({removed_item}). بانتظار تعديله.")
+    await query.edit_message_text(f"⚠️ تم إبلاغ الزبون بنقص ({removed_item}).")
     keyboard = [[InlineKeyboardButton("➕ إضافة أصناف بديلة", callback_data=f"editback_{order_id}")],
                 [InlineKeyboardButton("✅ إرسال الطلب المتبقي", callback_data=f"editready_{order_id}")]]
     await context.bot.send_message(chat_id=user_id, text=f"⚠️ عذراً، ({removed_item}) غير متوفر.\nسلتك الحالية: {new_details}\n\nحابب تضيف بديل ولا نعتمد هيك؟", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def customer_start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def customer_handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data.split("_")
     action, order_id = data[0], int(data[1])
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT details, location FROM orders WHERE id=%s", (order_id,))
     res = c.fetchone(); conn.close()
-    
     context.user_data['cart'] = [it.strip() for it in res[0].split(",")] if res[0] else []
     context.user_data['editing_order_id'] = order_id
-    context.user_data['office'] = res[1] if "مكتب" in res[1] else "حجز مكان"
-    
-    if action == "editback":
-        return await show_categories(update, context) # سيعود لـ CHOOSING_CATEGORY
+    if action == "editback": return await show_categories(update, context)
     else:
-        # إذا ضغط "إرسال المتبقي"، ننتقل فوراً لخطوة تأكيد المكان
         keyboard = [[InlineKeyboardButton("توصيل للمكتب 🖥️", callback_data='مكتب')], [InlineKeyboardButton("حجز بالمكان 🪑", callback_data='حجز مكان')]]
-        await query.edit_message_text("تأكيد مكان الاستلام للطلب المحدث:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("تأكيد مكان الاستلام:", reply_markup=InlineKeyboardMarkup(keyboard))
         return LOCATION_TYPE
 
-# --- الأوامر العامة ---
-async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("قديش قيمة فاتورتك؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancelpay")]]))
-    return PAY_AMOUNT
-
-async def get_pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['pay_amount'] = update.message.text
-    await update.message.reply_text(f"حوّل وارفع الإيصال 👇", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancelpay")]]))
-    return PAY_RECEIPT
-
-async def get_pay_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user; amt = int(context.user_data.get('pay_amount', 0))
-    conn = get_db_connection(); c = conn.cursor()
-    c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (%s, %s, %s, %s, %s, %s, %s)", (user.id, "فاتورة فورية", amt, "دفع فوري", datetime.now().strftime("%Y-%m-%d %H:%M"), "مقبول", 1))
-    conn.commit(); conn.close()
-    await update.message.reply_text("شكراً لك! ✨"); await context.bot.send_photo(chat_id=CASHIER_ID, photo=update.message.photo[-1].file_id, caption=f"💰 فاتورة فورية: {amt} ش")
-    return ConversationHandler.END
-
-async def cancel_pay_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); await query.edit_message_text("✅ تم الإلغاء."); return ConversationHandler.END
-
-async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db_connection(); c = conn.cursor(); c.execute("SELECT id, total_price, details FROM orders WHERE user_id=%s AND is_paid=0", (update.message.from_user.id,))
-    rows = c.fetchall(); conn.close()
-    if not rows: return await update.message.reply_text("سجلك نظيف! ✨")
-    await update.message.reply_text("📋 ديونك:\n" + "\n".join([f"#{r[0]} | {r[1]} ش | {r[2]}" for r in rows]))
-
+# --- الإدارة ---
 async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID: return
     conn = get_db_connection(); c = conn.cursor()
@@ -223,31 +242,21 @@ async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection(); c = conn.cursor(); c.execute("UPDATE orders SET is_paid=1 WHERE user_id=%s AND is_paid=0", (user_id,)); conn.commit(); conn.close()
     await query.edit_message_caption(caption="✅ تم التصفير."); await context.bot.send_message(chat_id=user_id, text="✅ تم تصفير حسابك.")
 
+async def cancel_pay_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer(); await query.edit_message_text("✅ تم الإلغاء."); return ConversationHandler.END
+
 async def post_init(application: Application):
     try: await application.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=OLD_CASHIER_ID))
     except: pass
-    await application.bot.set_my_commands([BotCommand("start", "طلب جديد"), BotCommand("pay", "دفع فوري"), BotCommand("ledger", "ديوني")], scope=BotCommandScopeDefault())
-    await application.bot.set_my_commands([BotCommand("start", "طلب جديد"), BotCommand("pay", "دفع فوري"), BotCommand("ledger_admin", "الحسابات")], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
+    await application.bot.set_my_commands([BotCommand("start", "طلب جديد ☕"), BotCommand("pay", "دفع فاتورة فورية 💳"), BotCommand("ledger", "سجل ديوني 📋")], scope=BotCommandScopeDefault())
+    await application.bot.set_my_commands([BotCommand("start", "طلب جديد ☕"), BotCommand("pay", "دفع فاتورة فورية 💳"), BotCommand("ledger_admin", "دفتر الحسابات 📔"), BotCommand("ledger", "سجل ديوني 📋")], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
 
 def main():
     init_db(); app = Application.builder().token(TOKEN).post_init(post_init).build()
-    
-    # التعديل هنا: أضفنا زر التعديل كـ Entry Point للمحادثة
     order_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler('start', start),
-            CallbackQueryHandler(customer_start_edit, pattern="^edit(back|ready)_") # دخول المحادثة عبر زر التعديل
-        ],
-        states={
-            ASK_OFFICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_office_and_show_menu)],
-            CHOOSING_CATEGORY: [CallbackQueryHandler(category_choice)],
-            CHOOSING_SERVICE: [CallbackQueryHandler(service_choice)],
-            CONFIRMING_CART: [CallbackQueryHandler(confirm_cart)],
-            LOCATION_TYPE: [CallbackQueryHandler(location_choice)]
-        },
-        fallbacks=[CommandHandler('start', start)]
-    )
-    
+        entry_points=[CommandHandler('start', start), CallbackQueryHandler(customer_handle_edit, pattern="^edit(back|ready)_")],
+        states={ASK_OFFICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_office_and_show_menu)], CHOOSING_CATEGORY: [CallbackQueryHandler(category_choice)], CHOOSING_SERVICE: [CallbackQueryHandler(service_choice)], CONFIRMING_CART: [CallbackQueryHandler(confirm_cart)], LOCATION_TYPE: [CallbackQueryHandler(location_choice)]},
+        fallbacks=[CommandHandler('start', start)])
     app.add_handler(order_conv)
     app.add_handler(ConversationHandler(entry_points=[CommandHandler('pay', start_instant_pay)], states={PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pay_amount), CallbackQueryHandler(cancel_pay_flow, pattern="^cancelpay$")], PAY_RECEIPT: [MessageHandler(filters.PHOTO | filters.Document.ALL, get_pay_receipt), CallbackQueryHandler(cancel_pay_flow, pattern="^cancelpay$")]}, fallbacks=[CommandHandler('pay', start_instant_pay)]))
     app.add_handler(CallbackQueryHandler(remove_item_from_order, pattern="^rmv_"))
