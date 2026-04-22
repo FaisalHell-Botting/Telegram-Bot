@@ -13,7 +13,7 @@ DB_NAME = 'orders_v2.db'
 
 # --- إعدادات السيرفر والـ Webhook (مهم جداً للتعديل) ---
 # حط الدومين تبعك هان (لازم يكون بيبدأ بـ https)
-WEBHOOK_DOMAIN = "https://your-bot-domain.onrender.com"
+WEBHOOK_DOMAIN = "https://lego-food-bot.onrender.com"
 # البورت اللي حنستخدمه
 PORT = int(os.environ.get('PORT', 8443)) 
 
