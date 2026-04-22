@@ -157,7 +157,7 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit(); conn.close()
 
 # ------------------------------------------------------------------
-# 2. ميزة دفع فاتورة فورية (/pay) معدلة
+# 2. ميزة دفع فاتورة فورية (/pay) وتسجيلها كإيرادات
 # ------------------------------------------------------------------
 async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "قديش قيمة فاتورتك عشان الحسابات عنا؟ 📊\nأدخل الرقم فقط (مثلاً: 15)"
@@ -174,10 +174,19 @@ async def get_pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_pay_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
-    amount = context.user_data.get('pay_amount', 'غير محدد')
-    await update.message.reply_text("شكراً لك على دفع الفاتورة! تم الإرسال للكاشير للإعتماد. 🌸")
+    amount_str = context.user_data.get('pay_amount', '0')
+    try: amount = int(amount_str)
+    except ValueError: amount = 0 # حماية لو الزبون كتب نص بدل رقم
+        
+    # تسجيل الفاتورة الفورية في الداتا بيز عشان تظهر في دفتر الحسابات
+    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+    c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (user.id, "فاتورة فورية", amount, "دفع فوري", datetime.now().strftime("%Y-%m-%d %H:%M"), "مقبول", 1))
+    conn.commit(); conn.close()
+
+    await update.message.reply_text("شكراً لك على دفع الفاتورة! تم تسجيلها واعتمادها بنجاح. 🌸")
     
-    caption = f"💰 **دفع فاتورة فورية!**\n👤 من: {user.first_name}\n💵 المبلغ: {amount} شيكل"
+    caption = f"💰 **دفع فاتورة فورية (تم تسجيلها)!**\n👤 من: {user.first_name}\n💵 المبلغ: {amount} شيكل"
     if update.message.photo: await context.bot.send_photo(chat_id=CASHIER_ID, photo=update.message.photo[-1].file_id, caption=caption)
     elif update.message.document: await context.bot.send_document(chat_id=CASHIER_ID, document=update.message.document.file_id, caption=caption)
     return ConversationHandler.END
@@ -188,7 +197,7 @@ async def cancel_pay_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ------------------------------------------------------------------
-# 3. وظائف الديون والإدارة
+# 3. وظائف الديون والإدارة (دفتر الحسابات الشامل)
 # ------------------------------------------------------------------
 async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -209,14 +218,29 @@ async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID: return
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("SELECT COUNT(*), SUM(total_price) FROM orders WHERE timestamp >= ?", (week_ago,))
-    stats = c.fetchone()
+    
+    # الإحصائيات الشاملة
+    c.execute("SELECT COUNT(*), SUM(total_price) FROM orders WHERE timestamp >= ? AND status != 'ملغي'", (week_ago,))
+    res1 = c.fetchone()
+    total_orders = res1[0] or 0
+    total_sales = res1[1] or 0
+    
+    c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= ? AND location='دفع فوري'", (week_ago,))
+    instant_total = c.fetchone()[0] or 0
+    
     c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= ? AND is_paid=0", (week_ago,))
     debt_total = c.fetchone()[0] or 0
+    
     c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid=0 GROUP BY user_id")
     debtors = c.fetchall(); conn.close()
     
-    text = f"📔 **دفتر الدين (آخر 7 أيام):**\n📦 إجمالي الطلبات للكل: {stats[0]}\n💰 المبيعات الكلية: {stats[1] or 0} ش\n🔴 الدين الإجمالي: {debt_total} ش\n\n**قائمة المكاتب المديونة:**"
+    text = f"📔 **دفتر الحسابات (آخر 7 أيام):**\n"
+    text += f"📦 إجمالي الطلبات للكل: {total_orders} حركة\n"
+    text += f"💰 المبيعات الكلية: {total_sales} شيكل\n"
+    text += f"⚡ فواتير فورية: {instant_total} شيكل\n"
+    text += f"🔴 فواتير غير مدفوعة: {debt_total} شيكل\n\n"
+    text += f"**قائمة الفواتير الغير مدفوعة (الديون):**"
+    
     keyboard = [[InlineKeyboardButton(f"🔔 تذكير {d[1]} ({d[2]} ش)", callback_data=f"remind_{d[0]}_{d[2]}")] for d in debtors]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -287,7 +311,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "طلب جديد ☕"),
         BotCommand("pay", "دفع فاتورة فورية 💳"),
-        BotCommand("ledger_admin", "دفتر الدين 📔"),
+        BotCommand("ledger_admin", "دفتر الحسابات 📔"),
         BotCommand("ledger", "سجل ديوني 📋")
     ], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
 
