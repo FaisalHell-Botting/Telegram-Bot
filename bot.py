@@ -12,7 +12,6 @@ CASHIER_ID = 5312266808
 DB_NAME = 'orders_v2.db'
 
 # --- إعدادات السيرفر والـ Webhook ---
-# تم وضع الدومين الخاص بك هان
 WEBHOOK_DOMAIN = "https://lego-food-bot.onrender.com"
 PORT = int(os.environ.get('PORT', 8443)) 
 
@@ -25,8 +24,10 @@ PRICES = {
     'برنجلز أحمر صغير': 6, 'برنجلز أحمر كبير': 11, 'برنجلز أحمر كبير شطة': 11, 'كيك فراولة': 7
 }
 
-CHOOSING_CATEGORY, CHOOSING_SERVICE, CONFIRMING_CART, LOCATION_TYPE, OFFICE_NUMBER = range(5)
+# حالات المحادثة
+ASK_OFFICE, CHOOSING_CATEGORY, CHOOSING_SERVICE, CONFIRMING_CART, LOCATION_TYPE = range(5)
 SETTLING_DEBT = 20
+PAY_AMOUNT, PAY_RECEIPT = 30, 31
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -39,9 +40,17 @@ def init_db():
                  status TEXT, is_paid INTEGER DEFAULT 0)''')
     conn.commit(); conn.close()
 
-# --- واجهة السلة والطلب ---
+# ------------------------------------------------------------------
+# 1. مسار الطلب الجديد (يبدأ بالمكتب وينتهي بالاستلام)
+# ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['cart'] = []
+    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة للبوت، يرجى كتابة **رقم مكتبك** الخاص في المساحة:"
+    await update.message.reply_text(text, parse_mode='Markdown')
+    return ASK_OFFICE
+
+async def save_office_and_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['office'] = f"مكتب {update.message.text}"
     return await show_categories(update, context)
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,7 +59,7 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🥪 سندويشات (بالمكان فقط)", callback_data='cat_sandwiches')],
                 [InlineKeyboardButton("🍫 شوكلاتة", callback_data='cat_choc')],
                 [InlineKeyboardButton("🍟 شبسي", callback_data='cat_chips')]]
-    text = 'يسعد أوقاتك! تفضل اختار القسم:'
+    text = 'تفضل اختار القسم اللي حابب تطلب منه:'
     if hasattr(update, 'callback_query') and update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSING_CATEGORY
@@ -90,39 +99,97 @@ async def confirm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await service_choice(update, context)
     
     has_sandwich = any("سندويش" in item for item in context.user_data.get('cart', []))
-    keyboard = [[InlineKeyboardButton("ع المكتب 🖥️", callback_data='مكتب'), InlineKeyboardButton("حجز بالمكان 🪑", callback_data='حجز مكان')]]
-    if has_sandwich: keyboard = [[InlineKeyboardButton("حجز بالمكان 🪑", callback_data='حجز مكان')]]
-    await query.edit_message_text(text="وين حابب تستلم الطلب؟", reply_markup=InlineKeyboardMarkup(keyboard))
+    office = context.user_data.get('office', 'مكتبك')
+    
+    if has_sandwich: 
+        keyboard = [[InlineKeyboardButton("حجز بالمكان 🪑", callback_data='حجز مكان')]]
+        text = "طلبك فيه سندويشات.. الاستلام فقط داخل (الكفي كورنر) نورتنا! ❤️"
+    else:
+        keyboard = [[InlineKeyboardButton(f"توصيل لـ {office} 🖥️", callback_data='مكتب')], 
+                    [InlineKeyboardButton("حجز بالمكان 🪑", callback_data='حجز مكان')]]
+        text = "وين حابب تستلم الطلب؟"
+        
+    await query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
     return LOCATION_TYPE
 
 async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
-    context.user_data['location_type'] = query.data
-    if query.data == 'مكتب':
-        await query.edit_message_text(text="اكتبلي رقم مكتبك:"); return OFFICE_NUMBER
-    else:
-        context.user_data['office'] = "حجز مكان"; return await send_order(update, context)
-
-async def get_office(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['office'] = f"مكتب {update.message.text}"; return await send_order(update, context)
-
-async def send_order(update, context):
-    user = (update.callback_query.from_user if update.callback_query else update.message.from_user)
-    cart = context.user_data['cart']; details = ", ".join(cart); total = sum(PRICES[item] for item in cart); office = context.user_data['office']
+    # تحديد مكان الاستلام النهائي
+    if query.data == 'مكتب': delivery_loc = context.user_data['office']
+    else: delivery_loc = "حجز بالمكان"
+    
+    user = query.from_user
+    cart = context.user_data['cart']; details = ", ".join(cart); total = sum(PRICES[item] for item in cart)
+    
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (user.id, details, total, office, datetime.now().strftime("%Y-%m-%d %H:%M"), "انتظار", 0))
+              (user.id, details, total, delivery_loc, datetime.now().strftime("%Y-%m-%d %H:%M"), "انتظار", 0))
     order_id = c.lastrowid; conn.commit(); conn.close()
     
-    keyboard = [[InlineKeyboardButton("✅ تأكيد وإضافة للدين", callback_data=f"conf_{user.id}_{order_id}")],
-                [InlineKeyboardButton("⚠️ صنف ناقص", callback_data=f"out_{user.id}_{order_id}")]]
-    await context.bot.send_message(chat_id=CASHIER_ID, text=f"🚨 **طلب #{order_id}**\n👤 {user.first_name}\n📦 {details}\n📍 {office}\n💰 {total} ش", reply_markup=InlineKeyboardMarkup(keyboard))
-    msg = "تم الإرسال للكاشير. حنبلغك أول ما يضاف للدين. ⏳"
-    if update.callback_query: await update.callback_query.edit_message_text(msg)
-    else: await update.message.reply_text(msg)
+    # إرسال للكاشير
+    keyboard_cashier = [[InlineKeyboardButton("✅ تأكيد وإضافة للدين", callback_data=f"conf_{user.id}_{order_id}")],
+                        [InlineKeyboardButton("⚠️ صنف ناقص", callback_data=f"out_{user.id}_{order_id}")]]
+    cashier_msg = await context.bot.send_message(chat_id=CASHIER_ID, text=f"🚨 **طلب #{order_id}**\n👤 {user.first_name}\n📦 {details}\n📍 {delivery_loc}\n💰 {total} ش", reply_markup=InlineKeyboardMarkup(keyboard_cashier))
+    
+    # حفظ رسالة الكاشير عشان نقدر نعدلها لو الزبون ألغى الطلب
+    context.user_data[f'cashier_msg_{order_id}'] = cashier_msg.message_id
+    
+    # رسالة الزبون مع زر الإلغاء
+    keyboard_user = [[InlineKeyboardButton("❌ إلغاء الطلب", callback_data=f"cancel_{order_id}")]]
+    await query.edit_message_text("تم الإرسال للكاشير. ⏳\nبإمكانك إلغاء الطلب طالما لم يتم تأكيده بعد.", reply_markup=InlineKeyboardMarkup(keyboard_user))
     return ConversationHandler.END
 
-# --- وظيفة سجل ديون المستخدم ---
+# ------------------------------------------------------------------
+# 2. ميزة إلغاء الطلب (مستقلة وتعمل في أي وقت قبل التأكيد)
+# ------------------------------------------------------------------
+async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    order_id = query.data.split("_")[1]
+    
+    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+    c.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+    status = c.fetchone()[0]
+    
+    if status == 'مقبول':
+        await query.edit_message_text("عذراً، الكاشير بدأ بتجهيز طلبك ولا يمكن إلغاؤه الآن. 👨‍🍳")
+    else:
+        c.execute("UPDATE orders SET status='ملغي' WHERE id=?", (order_id,))
+        await query.edit_message_text("✅ تم إلغاء الطلب بنجاح.")
+        
+        # تعديل رسالة الكاشير لإعلامه بالإلغاء
+        cashier_msg_id = context.user_data.get(f'cashier_msg_{order_id}')
+        if cashier_msg_id:
+            try:
+                await context.bot.edit_message_text(chat_id=CASHIER_ID, message_id=cashier_msg_id, text=f"🚫 **تم إلغاء الطلب #{order_id} من قبل الزبون.**")
+            except: pass
+    conn.commit(); conn.close()
+
+# ------------------------------------------------------------------
+# 3. ميزة دفع فاتورة فورية (/pay)
+# ------------------------------------------------------------------
+async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("اكتب المبلغ اللي حابب تدفعه هلقيت (مثلاً: 15):")
+    return PAY_AMOUNT
+
+async def get_pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['pay_amount'] = update.message.text
+    text = f"ممتاز! حوّل مبلغ **{update.message.text} شيكل** للمحفظة:\n`0597489605` (كمال عبيد)\n\nوارفع صورة الفاتورة (الإيصال) هان 👇"
+    await update.message.reply_text(text, parse_mode='Markdown')
+    return PAY_RECEIPT
+
+async def get_pay_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    amount = context.user_data.get('pay_amount', 'غير محدد')
+    await update.message.reply_text("شكراً لك على دفع الفاتورة! تم الإرسال للكاشير. 🌸")
+    
+    caption = f"💰 **دفع فاتورة فورية!**\n👤 من: {user.first_name}\n💵 المبلغ: {amount} شيكل"
+    if update.message.photo: await context.bot.send_photo(chat_id=CASHIER_ID, photo=update.message.photo[-1].file_id, caption=caption)
+    elif update.message.document: await context.bot.send_document(chat_id=CASHIER_ID, document=update.message.document.file_id, caption=caption)
+    return ConversationHandler.END
+
+# ------------------------------------------------------------------
+# 4. وظائف الديون والإدارة
+# ------------------------------------------------------------------
 async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
@@ -138,7 +205,6 @@ async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report += f"\n🔴 **إجمالي الدين المطلوب: {grand_total} شيكل**"
     await update.message.reply_text(report)
 
-# --- وظائف الإدارة ---
 async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID: return
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -154,21 +220,37 @@ async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(f"🔔 تذكير {d[1]} ({d[2]} ش)", callback_data=f"remind_{d[0]}_{d[2]}")] for d in debtors]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat_id != CASHIER_ID: return
-    keyboard = [[InlineKeyboardButton(f"📅 طلبات يوم {(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')}", callback_data=f"hdate_{(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')}")] for i in range(7)]
-    await update.message.reply_text("اختار اليوم اللي بدك تشوف سجل طلباته:", reply_markup=InlineKeyboardMarkup(keyboard))
+# ------------------------------------------------------------------
+# 5. معالجات الكاشير (معزولة تماماً عن الزبائن لمنع التداخل)
+# ------------------------------------------------------------------
+async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer(); data = query.data.split("_")
+    if data[0] == "conf":
+        conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+        # التأكد إن الزبون ما ألغى الطلب
+        c.execute("SELECT status FROM orders WHERE id=?", (data[2],))
+        status = c.fetchone()[0]
+        if status == 'ملغي':
+            await query.edit_message_text(query.message.text + "\n\n🚫 تنبيه: الزبون قام بإلغاء هذا الطلب.")
+            return
 
-async def history_day_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        c.execute("UPDATE orders SET status='مقبول' WHERE id=?", (data[2],))
+        conn.commit(); conn.close()
+        await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد.")
+        await context.bot.send_message(chat_id=data[1], text="✅ تم تأكيد طلبك وإضافته للدين. صحة وهنا!")
+
+async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
-    target_date = query.data.split("_")[1]
+    user_id = query.data.split("_")[1]
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("SELECT id, details, total_price, location, timestamp FROM orders WHERE timestamp LIKE ? ORDER BY id ASC", (f"{target_date}%",))
-    rows = c.fetchall(); conn.close()
-    if not rows: return await query.edit_message_text(f"ما في طلبات مسجلة ليوم {target_date}.")
-    report = f"📊 **تقرير يوم: {target_date}**\n📦 الطلبات: {len(rows)}\n💰 الدخل: {sum(r[2] for r in rows)} شيكل\n" + "═"*10 + "\n"
-    for r in rows: report += f"#{r[0]} | 🕓 {r[4].split()[1]} | 📍 {r[3]}\n📑 {r[1]}\n💰 {r[2]} شيكل\n" + "➖"*10 + "\n"
-    await query.edit_message_text(report)
+    c.execute("UPDATE orders SET is_paid=1 WHERE user_id=? AND is_paid=0", (user_id,))
+    conn.commit(); conn.close()
+    try:
+        await query.edit_message_caption(caption="✅ تم تصفير حساب المكتب بنجاح في قاعدة البيانات.")
+        await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك. شكراً لك! 🌸")
+        await context.bot.send_message(chat_id=CASHIER_ID, text="تم إرسال رسالة التصفير للزبون بنجاح. ✉️")
+    except Exception as e:
+        await context.bot.send_message(chat_id=CASHIER_ID, text="⚠️ تم تصفير الحساب، لكن حدث خطأ في رسالة الشكر.")
 
 async def send_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -180,7 +262,7 @@ async def send_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(query.message.text + f"\n\n✅ تم إرسال تذكير للمكتب.")
     except: await query.answer("تعذر الإرسال")
 
-# --- دورة تسديد الدين ---
+# --- دورة تسديد الدين (من التذكير) ---
 async def settle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     amount = query.data.split("_")[1]
@@ -198,45 +280,55 @@ async def receive_debt_receipt(update: Update, context: ContextTypes.DEFAULT_TYP
     elif update.message.document: await context.bot.send_document(chat_id=CASHIER_ID, document=update.message.document.file_id, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    user_id = query.data.split("_")[1]
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("UPDATE orders SET is_paid=1 WHERE user_id=? AND is_paid=0", (user_id,))
-    conn.commit(); conn.close()
-    try:
-        await query.edit_message_caption(caption="✅ تم تصفير حساب المكتب بنجاح في قاعدة البيانات.")
-        await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك. شكراً لك! 🌸")
-        await context.bot.send_message(chat_id=CASHIER_ID, text="تم إرسال رسالة التصفير للزبون بنجاح. ✉️")
-    except Exception as e:
-        await context.bot.send_message(chat_id=CASHIER_ID, text="⚠️ تم تصفير الحساب، لكن حدث خطأ في رسالة الشكر.")
 
-async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); data = query.data.split("_")
-    if data[0] == "conf":
-        conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-        c.execute("UPDATE orders SET status='مقبول' WHERE id=?", (data[2],))
-        conn.commit(); conn.close()
-        await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد.")
-        await context.bot.send_message(chat_id=data[1], text="✅ تم تأكيد طلبك وإضافته للدين. صحة وهنا!")
-
+# --- تخصيص قائمة الأوامر (Menu) ---
 async def post_init(application: Application):
-    await application.bot.set_my_commands([BotCommand("start", "طلب جديد ☕"), BotCommand("ledger", "سجل ديوني 📋")], scope=BotCommandScopeDefault())
-    await application.bot.set_my_commands([BotCommand("start", "طلب جديد ☕"), BotCommand("ledger_admin", "دفتر الدين 📔"), BotCommand("history", "سجل الأيام السابقة 📅"), BotCommand("ledger", "سجل ديوني 📋")], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
+    await application.bot.set_my_commands([
+        BotCommand("start", "طلب جديد ☕"),
+        BotCommand("pay", "دفع فاتورة فورية 💳"),
+        BotCommand("ledger", "سجل ديوني 📋")
+    ], scope=BotCommandScopeDefault())
+    
+    await application.bot.set_my_commands([
+        BotCommand("start", "طلب جديد ☕"),
+        BotCommand("pay", "دفع فاتورة فورية 💳"),
+        BotCommand("ledger_admin", "دفتر الدين 📔"),
+        BotCommand("ledger", "سجل ديوني 📋")
+    ], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
 
 def main():
-    init_db(); app = Application.builder().token(TOKEN).post_init(post_init).build()
+    init_db(); 
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    
+    # مسار الطلب الأساسي
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler('start', start), CallbackQueryHandler(settle_start, pattern="^settle_")],
-        states={CHOOSING_CATEGORY: [CallbackQueryHandler(category_choice)], CHOOSING_SERVICE: [CallbackQueryHandler(service_choice)],
-                CONFIRMING_CART: [CallbackQueryHandler(confirm_cart)], LOCATION_TYPE: [CallbackQueryHandler(location_choice)],
-                OFFICE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_office)],
-                SETTLING_DEBT: [MessageHandler(filters.PHOTO | filters.Document.ALL, receive_debt_receipt)]},
+        entry_points=[CommandHandler('start', start)],
+        states={ASK_OFFICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_office_and_show_menu)],
+                CHOOSING_CATEGORY: [CallbackQueryHandler(category_choice)], 
+                CHOOSING_SERVICE: [CallbackQueryHandler(service_choice)],
+                CONFIRMING_CART: [CallbackQueryHandler(confirm_cart)], 
+                LOCATION_TYPE: [CallbackQueryHandler(location_choice)]},
         fallbacks=[CommandHandler('start', start)]))
+
+    # مسار دفع فاتورة فورية
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('pay', start_instant_pay)],
+        states={PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pay_amount)],
+                PAY_RECEIPT: [MessageHandler(filters.PHOTO | filters.Document.ALL, get_pay_receipt)]},
+        fallbacks=[CommandHandler('pay', start_instant_pay)]))
+        
+    # مسار تسديد الدين (من التذكير)
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(settle_start, pattern="^settle_")],
+        states={SETTLING_DEBT: [MessageHandler(filters.PHOTO | filters.Document.ALL, receive_debt_receipt)]},
+        fallbacks=[CommandHandler('start', start)]))
+    
+    # أوامر عامة وإدارية
     app.add_handler(CommandHandler('ledger_admin', admin_ledger))
     app.add_handler(CommandHandler('ledger', user_ledger))
-    app.add_handler(CommandHandler('history', history_start))
-    app.add_handler(CallbackQueryHandler(history_day_details, pattern="^hdate_"))
+    
+    # معالجات الأزرار المعزولة (الزبائن والكاشير)
+    app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_"))
     app.add_handler(CallbackQueryHandler(send_reminder, pattern="^remind_"))
     app.add_handler(CallbackQueryHandler(clear_debt, pattern="^clear_"))
     app.add_handler(CallbackQueryHandler(cashier_action, pattern="^(conf|out)_"))
