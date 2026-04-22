@@ -11,10 +11,9 @@ TOKEN = '8705243157:AAEvgDT3PecE8fmwc962NnToHnJl2xpFhAQ'
 CASHIER_ID = 5312266808
 DB_NAME = 'orders_v2.db'
 
-# --- إعدادات السيرفر والـ Webhook (مهم جداً للتعديل) ---
-# حط الدومين تبعك هان (لازم يكون بيبدأ بـ https)
-WEBHOOK_DOMAIN = "https://your-bot-domain.onrender.com"
-# البورت اللي حنستخدمه
+# --- إعدادات السيرفر والـ Webhook ---
+# تم وضع الدومين الخاص بك هان
+WEBHOOK_DOMAIN = "https://lego-food-bot.onrender.com"
 PORT = int(os.environ.get('PORT', 8443)) 
 
 PRICES = {
@@ -139,33 +138,25 @@ async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report += f"\n🔴 **إجمالي الدين المطلوب: {grand_total} شيكل**"
     await update.message.reply_text(report)
 
-# --- وظائف الإدارة (دفتر الدين وسجل الطلبات) ---
+# --- وظائف الإدارة ---
 async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID: return
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    
     c.execute("SELECT COUNT(*), SUM(total_price) FROM orders WHERE timestamp >= ?", (week_ago,))
     stats = c.fetchone()
     c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= ? AND is_paid=0", (week_ago,))
     debt_total = c.fetchone()[0] or 0
-    
     c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid=0 GROUP BY user_id")
     debtors = c.fetchall(); conn.close()
     
     text = f"📔 **دفتر الدين (آخر 7 أيام):**\n📦 إجمالي الطلبات للكل: {stats[0]}\n💰 المبيعات الكلية: {stats[1] or 0} ش\n🔴 الدين الإجمالي: {debt_total} ش\n\n**قائمة المكاتب المديونة:**"
-    keyboard = []
-    for d in debtors:
-        keyboard.append([InlineKeyboardButton(f"🔔 تذكير {d[1]} ({d[2]} ش)", callback_data=f"remind_{d[0]}_{d[2]}")])
-    
+    keyboard = [[InlineKeyboardButton(f"🔔 تذكير {d[1]} ({d[2]} ش)", callback_data=f"remind_{d[0]}_{d[2]}")] for d in debtors]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID: return
-    keyboard = []
-    for i in range(7):
-        date_str = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-        keyboard.append([InlineKeyboardButton(f"📅 طلبات يوم {date_str}", callback_data=f"hdate_{date_str}")])
+    keyboard = [[InlineKeyboardButton(f"📅 طلبات يوم {(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')}", callback_data=f"hdate_{(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')}")] for i in range(7)]
     await update.message.reply_text("اختار اليوم اللي بدك تشوف سجل طلباته:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def history_day_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,15 +165,9 @@ async def history_day_details(update: Update, context: ContextTypes.DEFAULT_TYPE
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     c.execute("SELECT id, details, total_price, location, timestamp FROM orders WHERE timestamp LIKE ? ORDER BY id ASC", (f"{target_date}%",))
     rows = c.fetchall(); conn.close()
-    
     if not rows: return await query.edit_message_text(f"ما في طلبات مسجلة ليوم {target_date}.")
-    
-    count = len(rows)
-    total_rev = sum(r[2] for r in rows)
-    report = f"📊 **تقرير يوم: {target_date}**\n📦 عدد الطلبات: {count}\n💰 الدخل الإجمالي: {total_rev} شيكل\n" + "═"*10 + "\n"
-    for r in rows:
-        report += f"#{r[0]} | 🕓 {r[4].split()[1]} | 📍 {r[3]}\n📑 {r[1]}\n💰 {r[2]} شيكل\n" + "➖"*10 + "\n"
-    
+    report = f"📊 **تقرير يوم: {target_date}**\n📦 الطلبات: {len(rows)}\n💰 الدخل: {sum(r[2] for r in rows)} شيكل\n" + "═"*10 + "\n"
+    for r in rows: report += f"#{r[0]} | 🕓 {r[4].split()[1]} | 📍 {r[3]}\n📑 {r[1]}\n💰 {r[2]} شيكل\n" + "➖"*10 + "\n"
     await query.edit_message_text(report)
 
 async def send_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -193,7 +178,7 @@ async def send_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
         await query.edit_message_text(query.message.text + f"\n\n✅ تم إرسال تذكير للمكتب.")
-    except: await query.answer("تعذر الإرسال (اليوزر حظر البوت)")
+    except: await query.answer("تعذر الإرسال")
 
 # --- دورة تسديد الدين ---
 async def settle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,35 +191,25 @@ async def settle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_debt_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     amount = context.user_data.get('settle_amount', '?')
-    await update.message.reply_text("شكراً لك على تسديد المستحقات! ❤️\nوصل الإشعار للكاشير، وبمجرد التأكيد حيتم تصفير حسابك.")
-    
+    await update.message.reply_text("شكراً لك على تسديد المستحقات! ❤️\nوصل الإشعار للكاشير للتأكيد.")
     keyboard = [[InlineKeyboardButton("✅ تأكيد الاستلام وتصفير الحساب", callback_data=f"clear_{user.id}")]]
     caption = f"💰 **إشعار تسديد دين!**\n👤 {user.first_name}\n💰 المبلغ: {amount} ش"
     if update.message.photo: await context.bot.send_photo(chat_id=CASHIER_ID, photo=update.message.photo[-1].file_id, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     elif update.message.document: await context.bot.send_document(chat_id=CASHIER_ID, document=update.message.document.file_id, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# --- التحديث المهم: تصفير الدين بدون تأخير باستخدام edit_message_caption ---
 async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
+    query = update.callback_query; await query.answer()
     user_id = query.data.split("_")[1]
-    
-    # 1. تحديث قاعدة البيانات
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     c.execute("UPDATE orders SET is_paid=1 WHERE user_id=? AND is_paid=0", (user_id,))
     conn.commit(); conn.close()
-    
-    # 2. التواصل مع تيليجرام
     try:
-        # التعديل هان: استخدمنا edit_message_caption لأن الرسالة تحتوي على صورة أو ملف (إشعار الدفع)
         await query.edit_message_caption(caption="✅ تم تصفير حساب المكتب بنجاح في قاعدة البيانات.")
         await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك. شكراً لك! 🌸")
         await context.bot.send_message(chat_id=CASHIER_ID, text="تم إرسال رسالة التصفير للزبون بنجاح. ✉️")
     except Exception as e:
-        logging.error(f"Error sending clear debt message: {e}")
-        await context.bot.send_message(chat_id=CASHIER_ID, text="⚠️ تم تصفير الحساب بالدفتر، بس صار مشكلة في إرسال رسالة الشكر للزبون.")
+        await context.bot.send_message(chat_id=CASHIER_ID, text="⚠️ تم تصفير الحساب، لكن حدث خطأ في رسالة الشكر.")
 
 async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data.split("_")
@@ -245,56 +220,28 @@ async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد.")
         await context.bot.send_message(chat_id=data[1], text="✅ تم تأكيد طلبك وإضافته للدين. صحة وهنا!")
 
-# --- تخصيص قائمة الأوامر (Menu) ---
 async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "طلب جديد ☕"),
-        BotCommand("ledger", "سجل ديوني 📋")
-    ], scope=BotCommandScopeDefault())
-    
-    await application.bot.set_my_commands([
-        BotCommand("start", "طلب جديد ☕"),
-        BotCommand("ledger_admin", "دفتر الدين 📔"),
-        BotCommand("history", "سجل الأيام السابقة 📅"),
-        BotCommand("ledger", "سجل ديوني 📋")
-    ], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
+    await application.bot.set_my_commands([BotCommand("start", "طلب جديد ☕"), BotCommand("ledger", "سجل ديوني 📋")], scope=BotCommandScopeDefault())
+    await application.bot.set_my_commands([BotCommand("start", "طلب جديد ☕"), BotCommand("ledger_admin", "دفتر الدين 📔"), BotCommand("history", "سجل الأيام السابقة 📅"), BotCommand("ledger", "سجل ديوني 📋")], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
 
-# -----------------------------------------------------
-# التعديل الجوهري: تشغيل البوت بنظام Webhooks
-# -----------------------------------------------------
 def main():
-    init_db(); 
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-    
+    init_db(); app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('start', start), CallbackQueryHandler(settle_start, pattern="^settle_")],
-        states={CHOOSING_CATEGORY: [CallbackQueryHandler(category_choice)], 
-                CHOOSING_SERVICE: [CallbackQueryHandler(service_choice)],
-                CONFIRMING_CART: [CallbackQueryHandler(confirm_cart)], 
-                LOCATION_TYPE: [CallbackQueryHandler(location_choice)],
+        states={CHOOSING_CATEGORY: [CallbackQueryHandler(category_choice)], CHOOSING_SERVICE: [CallbackQueryHandler(service_choice)],
+                CONFIRMING_CART: [CallbackQueryHandler(confirm_cart)], LOCATION_TYPE: [CallbackQueryHandler(location_choice)],
                 OFFICE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_office)],
                 SETTLING_DEBT: [MessageHandler(filters.PHOTO | filters.Document.ALL, receive_debt_receipt)]},
         fallbacks=[CommandHandler('start', start)]))
-    
     app.add_handler(CommandHandler('ledger_admin', admin_ledger))
     app.add_handler(CommandHandler('ledger', user_ledger))
     app.add_handler(CommandHandler('history', history_start))
-    
     app.add_handler(CallbackQueryHandler(history_day_details, pattern="^hdate_"))
     app.add_handler(CallbackQueryHandler(send_reminder, pattern="^remind_"))
     app.add_handler(CallbackQueryHandler(clear_debt, pattern="^clear_"))
     app.add_handler(CallbackQueryHandler(cashier_action, pattern="^(conf|out)_"))
     
-    print(f"جاري تشغيل البوت بنظام Webhooks على البورت {PORT}..")
-    
-    # سيقوم البوت بفتح سيرفر داخلي والاستماع للطلبات القادمة من تيليجرام
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        secret_token="SecretPassword123", # باسوورد أمني بين سيرفرك وتيليجرام
-        webhook_url=f"{WEBHOOK_DOMAIN}",
-        drop_pending_updates=True
-    )
+    print(f"Running Webhook on {PORT}")
+    app.run_webhook(listen="0.0.0.0", port=PORT, secret_token="SecretPassword123", webhook_url=f"{WEBHOOK_DOMAIN}", drop_pending_updates=True)
 
-if __name__ == '__main__': 
-    main()
+if __name__ == '__main__': main()
