@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 # --- الإعدادات ---
 TOKEN = '8705243157:AAEvgDT3PecE8fmwc962NnToHnJl2xpFhAQ'
-CASHIER_ID = 7447129659
+CASHIER_ID = 7447129659 # الـ ID الجديد المعتمد
 
 # رابط الداتا بيز السحابية بنجيبه من إعدادات Render
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -39,7 +39,6 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection(); c = conn.cursor()
-    # تم التعديل لتناسب PostgreSQL (استخدام SERIAL و BIGINT)
     c.execute('''CREATE TABLE IF NOT EXISTS orders
                  (id SERIAL PRIMARY KEY, user_id BIGINT,
                  details TEXT, total_price INTEGER, location TEXT, timestamp TEXT, 
@@ -127,7 +126,6 @@ async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cart = context.user_data['cart']; details = ", ".join(cart); total = sum(PRICES[item] for item in cart)
     
     conn = get_db_connection(); c = conn.cursor()
-    # تم تغيير ? إلى %s وإضافة RETURNING id
     c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
               (user.id, details, total, delivery_loc, datetime.now().strftime("%Y-%m-%d %H:%M"), "انتظار", 0))
     order_id = c.fetchone()[0]; conn.commit(); conn.close()
@@ -149,7 +147,7 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT status FROM orders WHERE id=%s", (order_id,))
     res = c.fetchone()
-    if not res: return # حماية إضافية
+    if not res: return 
     status = res[0]
     
     if status == 'مقبول':
@@ -166,7 +164,7 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit(); conn.close()
 
 # ------------------------------------------------------------------
-# 2. ميزة دفع فاتورة فورية (/pay) وتسجيلها كإيرادات
+# 2. ميزة دفع فاتورة فورية (/pay)
 # ------------------------------------------------------------------
 async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "قديش قيمة فاتورتك عشان الحسابات عنا؟ 📊\nأدخل الرقم فقط (مثلاً: 15)"
@@ -223,7 +221,10 @@ async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report)
 
 async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat_id != CASHIER_ID: return
+    # الفحص هنا صار يعتمد على الـ CASHIER_ID المحدث
+    if update.message.chat_id != CASHIER_ID:
+        return # لن يفتح لأي شخص غير الكاشير الحقيقي
+
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     conn = get_db_connection(); c = conn.cursor()
     
@@ -238,7 +239,7 @@ async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= %s AND is_paid=0", (week_ago,))
     debt_total = c.fetchone()[0] or 0
     
-    c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid=0 GROUP BY user_id")
+    c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid=0 GROUP BY user_id, location")
     debtors = c.fetchall(); conn.close()
     
     text = f"📔 **دفتر الحسابات (آخر 7 أيام):**\n"
@@ -306,14 +307,20 @@ async def receive_debt_receipt(update: Update, context: ContextTypes.DEFAULT_TYP
     elif update.message.document: await context.bot.send_document(chat_id=CASHIER_ID, document=update.message.document.file_id, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
+
 # --- تخصيص قائمة الأوامر (Menu) ---
 async def post_init(application: Application):
+    # 1. مسح أي أوامر مخصصة قديمة (تنظيف الكاش)
+    await application.bot.delete_my_commands(scope=BotCommandScopeDefault())
+    
+    # 2. تعيين الأوامر الافتراضية للجميع (الزبائن)
     await application.bot.set_my_commands([
         BotCommand("start", "طلب جديد ☕"),
         BotCommand("pay", "دفع فاتورة فورية 💳"),
         BotCommand("ledger", "سجل ديوني 📋")
     ], scope=BotCommandScopeDefault())
     
+    # 3. تعيين الأوامر المخصصة للكاشير الجديد فقط
     await application.bot.set_my_commands([
         BotCommand("start", "طلب جديد ☕"),
         BotCommand("pay", "دفع فاتورة فورية 💳"),
