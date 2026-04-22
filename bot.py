@@ -1,4 +1,4 @@
-import sqlite3
+import psycopg2
 import logging
 import asyncio
 import os
@@ -9,7 +9,9 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 # --- الإعدادات ---
 TOKEN = '8705243157:AAEvgDT3PecE8fmwc962NnToHnJl2xpFhAQ'
 CASHIER_ID = 5312266808
-DB_NAME = 'orders_v2.db'
+
+# رابط الداتا بيز السحابية بنجيبه من إعدادات Render
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 # --- إعدادات السيرفر والـ Webhook ---
 WEBHOOK_DOMAIN = "https://lego-food-bot.onrender.com"
@@ -31,11 +33,15 @@ PAY_AMOUNT, PAY_RECEIPT = 30, 31
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- قاعدة البيانات ---
+# --- دالة الاتصال بقاعدة البيانات السحابية ---
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+    conn = get_db_connection(); c = conn.cursor()
+    # تم التعديل لتناسب PostgreSQL (استخدام SERIAL و BIGINT)
     c.execute('''CREATE TABLE IF NOT EXISTS orders
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                 (id SERIAL PRIMARY KEY, user_id BIGINT,
                  details TEXT, total_price INTEGER, location TEXT, timestamp TEXT, 
                  status TEXT, is_paid INTEGER DEFAULT 0)''')
     conn.commit(); conn.close()
@@ -120,10 +126,11 @@ async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     cart = context.user_data['cart']; details = ", ".join(cart); total = sum(PRICES[item] for item in cart)
     
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    conn = get_db_connection(); c = conn.cursor()
+    # تم تغيير ? إلى %s وإضافة RETURNING id
+    c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
               (user.id, details, total, delivery_loc, datetime.now().strftime("%Y-%m-%d %H:%M"), "انتظار", 0))
-    order_id = c.lastrowid; conn.commit(); conn.close()
+    order_id = c.fetchone()[0]; conn.commit(); conn.close()
     
     keyboard_cashier = [[InlineKeyboardButton("✅ تأكيد وإضافة للدين", callback_data=f"conf_{user.id}_{order_id}")],
                         [InlineKeyboardButton("⚠️ صنف ناقص", callback_data=f"out_{user.id}_{order_id}")]]
@@ -139,14 +146,16 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     order_id = query.data.split("_")[1]
     
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("SELECT status FROM orders WHERE id=?", (order_id,))
-    status = c.fetchone()[0]
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT status FROM orders WHERE id=%s", (order_id,))
+    res = c.fetchone()
+    if not res: return # حماية إضافية
+    status = res[0]
     
     if status == 'مقبول':
         await query.edit_message_text("عذراً، الكاشير بدأ بتجهيز طلبك ولا يمكن إلغاؤه الآن. 👨‍🍳")
     else:
-        c.execute("UPDATE orders SET status='ملغي' WHERE id=?", (order_id,))
+        c.execute("UPDATE orders SET status='ملغي' WHERE id=%s", (order_id,))
         await query.edit_message_text("✅ تم إلغاء الطلب بنجاح.")
         
         cashier_msg_id = context.user_data.get(f'cashier_msg_{order_id}')
@@ -176,11 +185,10 @@ async def get_pay_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     amount_str = context.user_data.get('pay_amount', '0')
     try: amount = int(amount_str)
-    except ValueError: amount = 0 # حماية لو الزبون كتب نص بدل رقم
+    except ValueError: amount = 0
         
-    # تسجيل الفاتورة الفورية في الداتا بيز عشان تظهر في دفتر الحسابات
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("INSERT INTO orders (user_id, details, total_price, location, timestamp, status, is_paid) VALUES (%s, %s, %s, %s, %s, %s, %s)",
               (user.id, "فاتورة فورية", amount, "دفع فوري", datetime.now().strftime("%Y-%m-%d %H:%M"), "مقبول", 1))
     conn.commit(); conn.close()
 
@@ -201,8 +209,8 @@ async def cancel_pay_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------------
 async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("SELECT id, timestamp, total_price, details FROM orders WHERE user_id=? AND is_paid=0 ORDER BY id DESC", (user_id,))
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT id, timestamp, total_price, details FROM orders WHERE user_id=%s AND is_paid=0 ORDER BY id DESC", (user_id,))
     rows = c.fetchall(); conn.close()
     if not rows: return await update.message.reply_text("سجلك نظيف! ما عليك أي ديون حالياً. ✨")
     
@@ -217,18 +225,17 @@ async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID: return
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+    conn = get_db_connection(); c = conn.cursor()
     
-    # الإحصائيات الشاملة
-    c.execute("SELECT COUNT(*), SUM(total_price) FROM orders WHERE timestamp >= ? AND status != 'ملغي'", (week_ago,))
+    c.execute("SELECT COUNT(*), SUM(total_price) FROM orders WHERE timestamp >= %s AND status != 'ملغي'", (week_ago,))
     res1 = c.fetchone()
     total_orders = res1[0] or 0
     total_sales = res1[1] or 0
     
-    c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= ? AND location='دفع فوري'", (week_ago,))
+    c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= %s AND location='دفع فوري'", (week_ago,))
     instant_total = c.fetchone()[0] or 0
     
-    c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= ? AND is_paid=0", (week_ago,))
+    c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= %s AND is_paid=0", (week_ago,))
     debt_total = c.fetchone()[0] or 0
     
     c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid=0 GROUP BY user_id")
@@ -247,14 +254,14 @@ async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data.split("_")
     if data[0] == "conf":
-        conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-        c.execute("SELECT status FROM orders WHERE id=?", (data[2],))
+        conn = get_db_connection(); c = conn.cursor()
+        c.execute("SELECT status FROM orders WHERE id=%s", (data[2],))
         status = c.fetchone()[0]
         if status == 'ملغي':
             await query.edit_message_text(query.message.text + "\n\n🚫 تنبيه: الزبون قام بإلغاء هذا الطلب.")
             return
 
-        c.execute("UPDATE orders SET status='مقبول' WHERE id=?", (data[2],))
+        c.execute("UPDATE orders SET status='مقبول' WHERE id=%s", (data[2],))
         conn.commit(); conn.close()
         await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد.")
         await context.bot.send_message(chat_id=data[1], text="✅ تم تأكيد طلبك وإضافته للدين. صحة وهنا!")
@@ -262,8 +269,8 @@ async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     user_id = query.data.split("_")[1]
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("UPDATE orders SET is_paid=1 WHERE user_id=? AND is_paid=0", (user_id,))
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("UPDATE orders SET is_paid=1 WHERE user_id=%s AND is_paid=0", (user_id,))
     conn.commit(); conn.close()
     try:
         await query.edit_message_caption(caption="✅ تم تصفير حساب المكتب بنجاح في قاعدة البيانات.")
@@ -299,7 +306,6 @@ async def receive_debt_receipt(update: Update, context: ContextTypes.DEFAULT_TYP
     elif update.message.document: await context.bot.send_document(chat_id=CASHIER_ID, document=update.message.document.file_id, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-
 # --- تخصيص قائمة الأوامر (Menu) ---
 async def post_init(application: Application):
     await application.bot.set_my_commands([
@@ -316,7 +322,11 @@ async def post_init(application: Application):
     ], scope=BotCommandScopeChat(chat_id=CASHIER_ID))
 
 def main():
-    init_db(); 
+    if not DATABASE_URL:
+        print("🚨 تحذير: لم يتم العثور على DATABASE_URL في متغيرات البيئة!")
+        return
+
+    init_db()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     
     app.add_handler(ConversationHandler(
@@ -347,7 +357,7 @@ def main():
     app.add_handler(CallbackQueryHandler(clear_debt, pattern="^clear_"))
     app.add_handler(CallbackQueryHandler(cashier_action, pattern="^(conf|out)_"))
     
-    print(f"Running Webhook on {PORT}")
+    print(f"Running Webhook on {PORT} with PostgreSQL Database.")
     app.run_webhook(listen="0.0.0.0", port=PORT, secret_token="SecretPassword123", webhook_url=f"{WEBHOOK_DOMAIN}", drop_pending_updates=True)
 
 if __name__ == '__main__': main()
