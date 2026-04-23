@@ -297,7 +297,7 @@ async def cancel_pay_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ------------------------------------------------------------------
-# إضافة: استكمال مسار "تسديد الدين" بناءً على إشعار الكاشير
+# مسار "تسديد الدين" بناءً على إشعار الكاشير
 # ------------------------------------------------------------------
 async def settle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
@@ -421,6 +421,11 @@ async def customer_handle_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['cart'] = [it.strip() for it in res[0].split(",")] if res[0] else []
     context.user_data['editing_order_id'] = order_id
     context.user_data['last_msg_id'] = query.message.message_id 
+    
+    # 💡 التعديل الخاص بإرجاع رقم المكتب للذاكرة بعد سحبه من قاعدة البيانات
+    if res[1] and "مكتب" in res[1]:
+        context.user_data['office'] = res[1]
+
     if action == "editback": return await show_categories(update, context)
     else:
         keyboard = [[InlineKeyboardButton("توصيل للمكتب 🖥️", callback_data='loc_office')], [InlineKeyboardButton("حجز بالمكان 🪑", callback_data='loc_place')]]
@@ -456,7 +461,6 @@ async def send_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("💳 تسديد الآن", callback_data=f"settle_{amt}")]]
     try:
         await context.bot.send_message(chat_id=uid, text=f"🔔 تذكير لطيف: تفضل بتسديد مستحقات الكوفي كورنر بقيمة {amt} شيكل لضمان استمرار الخدمة.", reply_markup=InlineKeyboardMarkup(keyboard))
-        # رسالة منبثقة (Popup) للكاشير بدل تخريب الدفتر
         await query.answer("✅ تم إرسال التذكير بنجاح للموظف!", show_alert=True)
     except Exception:
         await query.answer("⚠️ تعذر الإرسال، يبدو أن المستخدم قام بحظر البوت.", show_alert=True)
@@ -469,7 +473,6 @@ async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         c.close()
     
-    # محاولة تعديل رسالة الإيصال للكاشير بدل مسحها عشان يضل الأرشيف
     try: await query.edit_message_caption(caption=f"{query.message.caption}\n\n✅ تم تأكيد استلام المبلغ وتصفير الحساب.")
     except Exception: pass
     
@@ -490,7 +493,7 @@ def main():
             CommandHandler('start', start), 
             CommandHandler('pay', start_instant_pay),
             CallbackQueryHandler(customer_handle_edit, pattern="^edit(back|ready)_"),
-            CallbackQueryHandler(settle_start, pattern="^settle_") # إضافة الدخول لمسار تسديد الدين
+            CallbackQueryHandler(settle_start, pattern="^settle_")
         ],
         states={
             ASK_OFFICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_office_and_show_menu)], 
