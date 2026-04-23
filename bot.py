@@ -3,6 +3,8 @@ from psycopg2 import pool
 import logging
 import asyncio
 import os
+import json
+import google.generativeai as genai
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
@@ -18,6 +20,11 @@ WEBHOOK_DOMAIN = "https://lego-food-bot.onrender.com"
 PORT = int(os.environ.get('PORT', 8443))
 
 WALLET_NUMBER = os.environ.get('WALLET_NUMBER', '0597489605')
+
+# إعداد الذكاء الاصطناعي Gemini
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 PRICES = {
     'شاي': 1, 'قهوة مزاج وسط': 2, 'قهوة مزاج كبير': 3, 'نسكافيه مكس': 2, 'كفي مكس': 2, 'كابتشينو جوداي': 3,
@@ -72,6 +79,26 @@ async def cleanup_old_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
 
+# --- Helper Function لعرض السلة بشكل موحد ---
+async def show_cart_ui(update: Update, context: ContextTypes.DEFAULT_TYPE, base_text=""):
+    cart = context.user_data.get('cart', [])
+    total = sum(PRICES[item] for item in cart)
+    cart_list = "\n".join([f"• {item}" for item in cart])
+    text = f"{base_text}\n\n🛒 سلتك الحالية:\n{cart_list}\n\n💰 المجموع: {total} شيكل"
+
+    keyboard = [[InlineKeyboardButton(f"❌ حذف {item}", callback_data=f'remove_{i}')] for i, item in enumerate(cart)]
+    keyboard.append([InlineKeyboardButton("➕ إضافة أصناف", callback_data='add_more')])
+    keyboard.append([InlineKeyboardButton("✅ تأكيد الطلب وإرساله", callback_data='confirm_order')])
+    keyboard.append([InlineKeyboardButton("🗑️ إلغاء الطلب بالكامل", callback_data='cancel_order')])
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text=text.strip(), reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data['last_msg_id'] = update.callback_query.message.message_id
+    else:
+        msg = await update.message.reply_text(text=text.strip(), reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data['last_msg_id'] = msg.message_id
+    return CONFIRMING_CART
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
     if update.message:
@@ -83,7 +110,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
     context.user_data.clear()
     context.user_data['cart'] = []
-    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:"
+    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(أو يمكنك كتابة طلبك مباشرة، مثلاً: بدي 2 قهوة وسط لمكتب 15)*"
     if update.message:
         msg = await update.message.reply_text(text, parse_mode='Markdown')
         context.user_data['last_msg_id'] = msg.message_id
@@ -92,12 +119,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_office_and_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     
-    # حماية لمنع إدخال الكلمات العشوائية أو الأوامر في مكان رقم المكتب
     if "منيو" in user_text or len(user_text) > 15:
         await update.message.reply_text("⚠️ الرجاء كتابة رقم أو اسم مكتب صحيح (مثال: 15):")
         return ASK_OFFICE
 
     context.user_data['office'] = f"مكتب {user_text}"
+    
+    # إذا كان هناك سلة ممتلئة مسبقاً (جاءت من الـ AI ولم يكن المكتب محدداً)
+    if context.user_data.get('cart'):
+        return await show_cart_ui(update, context, "✅ تم حفظ رقم المكتب بنجاح.")
+        
     return await show_categories(update, context)
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -109,10 +140,9 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🍟 شبسي", callback_data='cat_chips')]
     ]
     text = 'تفضل اختار القسم:'
-    query = update.callback_query
-    if query:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        context.user_data['last_msg_id'] = query.message.message_id
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data['last_msg_id'] = update.callback_query.message.message_id
     else:
         msg = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         context.user_data['last_msg_id'] = msg.message_id
@@ -143,16 +173,8 @@ async def service_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith('item_'):
         item_name = query.data.replace('item_', '')
         context.user_data.setdefault('cart', []).append(item_name)
-    total = sum(PRICES[item] for item in context.user_data['cart'])
-    cart_list = "\n".join([f"• {item}" for item in context.user_data['cart']])
-    keyboard = [[InlineKeyboardButton(f"❌ حذف {item}", callback_data=f'remove_{i}')] for i, item in enumerate(context.user_data['cart'])]
-    keyboard.append([InlineKeyboardButton("➕ إضافة أصناف", callback_data='add_more')])
-    keyboard.append([InlineKeyboardButton("✅ تأكيد الطلب وإرساله", callback_data='confirm_order')])
-    keyboard.append([InlineKeyboardButton("🗑️ إلغاء الطلب بالكامل", callback_data='cancel_order')])
-    await query.edit_message_text(text=f"🛒 سلتك الحالية:\n{cart_list}\n\n💰 المجموع: {total} شيكل",
-        reply_markup=InlineKeyboardMarkup(keyboard))
-    context.user_data['last_msg_id'] = query.message.message_id
-    return CONFIRMING_CART
+    
+    return await show_cart_ui(update, context)
 
 async def confirm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -170,16 +192,9 @@ async def confirm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.user_data.get('cart'):
             await query.edit_message_text("سلتك فارغة الآن. الرجاء اختيار قسم من جديد:")
             return await show_categories(update, context)
-        total = sum(PRICES[item] for item in context.user_data['cart'])
-        cart_list = "\n".join([f"• {item}" for item in context.user_data['cart']])
-        keyboard = [[InlineKeyboardButton(f"❌ حذف {item}", callback_data=f'remove_{i}')] for i, item in enumerate(context.user_data['cart'])]
-        keyboard.append([InlineKeyboardButton("➕ إضافة أصناف", callback_data='add_more')])
-        keyboard.append([InlineKeyboardButton("✅ تأكيد الطلب وإرساله", callback_data='confirm_order')])
-        keyboard.append([InlineKeyboardButton("🗑️ إلغاء الطلب بالكامل", callback_data='cancel_order')])
-        await query.edit_message_text(text=f"🛒 سلتك الحالية:\n{cart_list}\n\n💰 المجموع: {total} شيكل",
-            reply_markup=InlineKeyboardMarkup(keyboard))
-        context.user_data['last_msg_id'] = query.message.message_id
-        return CONFIRMING_CART
+        
+        return await show_cart_ui(update, context)
+        
     elif query.data == 'confirm_order':
         has_sandwich = any("سندويش" in item for item in context.user_data.get('cart', []))
         office = context.user_data.get('office', 'مكتبك')
@@ -192,6 +207,71 @@ async def confirm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="وين حابب تستلم؟", reply_markup=InlineKeyboardMarkup(keyboard))
         context.user_data['last_msg_id'] = query.message.message_id
         return LOCATION_TYPE
+
+# ------------------------------------------------------------------
+# ===== ذكاء اصطناعي: التقاط الطلب الحر عبر Gemini =====
+# ------------------------------------------------------------------
+async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip()
+    
+    if len(user_text) < 3 or not GEMINI_API_KEY:
+        await unknown_text(update, context)
+        return ConversationHandler.END
+
+    wait_msg = await update.message.reply_text("🤖 جاري فهم طلبك...")
+
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
+        prompt = f"""
+        أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من رسالة الزبون التالية: '{user_text}'
+        قائمة الأصناف المتاحة حرفياً: {list(PRICES.keys())}
+        القواعد:
+        1. طابق الأصناف مع القائمة المتاحة فقط.
+        2. إذا طلب كمية (مثلا 2 قهوة وسط)، كرر اسم الصنف في المصفوفة مرتين.
+        3. إذا طلب شيئاً غير متوفر، ضعه في مصفوفة unmatched.
+        4. استخرج رقم المكتب إذا ذكره الزبون (أرقام فقط)، وإلا اجعله null.
+        يجب أن يكون الرد بصيغة JSON فقط بهذا الهيكل:
+        {{"office": "15", "items": ["شاي", "قهوة مزاج وسط", "قهوة مزاج وسط"], "unmatched": ["عصير رمان"]}}
+        """
+        response = model.generate_content(prompt)
+        data = json.loads(response.text)
+
+        items = data.get("items", [])
+        unmatched = data.get("unmatched", [])
+        office = data.get("office")
+
+        await wait_msg.delete()
+
+        if not items and not unmatched:
+            await unknown_text(update, context)
+            return ConversationHandler.END
+
+        # تحديث بيانات السلة
+        context.user_data['cart'] = items
+        reply_text = ""
+        
+        if unmatched:
+            reply_text += f"⚠️ المعذرة، هذه الأصناف غير متوفرة لدينا: {', '.join(unmatched)}\n"
+
+        if items:
+            if office:
+                context.user_data['office'] = f"مكتب {office}"
+                return await show_cart_ui(update, context, reply_text + "🤖 فهمت طلبك تماماً!")
+            else:
+                reply_text += "🤖 فهمت الأصناف المطلوبة، لكن **ما هو رقم مكتبك؟** الرجاء كتابته الآن:"
+                msg = await update.message.reply_text(reply_text)
+                context.user_data['last_msg_id'] = msg.message_id
+                return ASK_OFFICE
+        else:
+            await update.message.reply_text(reply_text + "\nلم أجد أصنافاً متاحة في طلبك، يرجى المحاولة عبر الأزرار.")
+            return ConversationHandler.END
+
+    except Exception as e:
+        logger.error(f"Gemini Error: {e}")
+        await wait_msg.delete()
+        await unknown_text(update, context)
+        return ConversationHandler.END
+
 
 async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -386,10 +466,7 @@ async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------------
 
 async def _send_rating_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    مهمة مجدولة — تُرسَل بعد 10 دقائق من تأكيد الكاشير للطلب.
-    تحتاج: pip install 'python-telegram-bot[job-queue]'
-    """
+    """مهمة مجدولة — تُرسَل بعد 10 دقائق من تأكيد الكاشير للطلب."""
     user_id  = context.job.data['user_id']
     order_id = context.job.data['order_id']
     keyboard = [
@@ -411,7 +488,6 @@ async def _send_rating_job(context: ContextTypes.DEFAULT_TYPE):
 def schedule_rating_request(context: ContextTypes.DEFAULT_TYPE, user_id: int, order_id: int, delay_minutes: int = 10):
     """جدولة رسالة التقييم بعد delay_minutes دقيقة"""
     if context.application.job_queue is None:
-        logger.warning("job_queue غير مفعّل — لن تُرسَل رسالة التقييم. ثبّت: pip install 'python-telegram-bot[job-queue]'")
         return
     context.application.job_queue.run_once(
         _send_rating_job,
@@ -440,8 +516,7 @@ async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         c.close()
     rating_labels = {5: "🌟 ممتاز وسريع، رائع!!", 4: "😊 كويس", 3: "😐 عادي", 2: "🐢 بطيء", 1: "😤 بصراحة مش نافع"}
-    await query.edit_message_text(
-        f"شكراً على تقييمك! ❤️\nاخترت: {rating_labels.get(rating_val, '')}\nرأيك مهم لتحسين الخدمة. 🌸")
+    await query.edit_message_text(f"شكراً على تقييمك! ❤️\nاخترت: {rating_labels.get(rating_val, '')}\nرأيك مهم لتحسين الخدمة. 🌸")
 
 async def admin_ratings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر /ratings — إحصائيات التقييمات للكاشير فقط"""
@@ -459,11 +534,7 @@ async def admin_ratings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     avg_str = f"{avg_rating:.1f}" if avg_rating else "—"
     stars   = "⭐" * round(avg_rating) if avg_rating else ""
-    report = (
-        f"📊 **إحصائيات التقييمات:**\n\n"
-        f"✨ متوسط التقييم: {avg_str} / 5  {stars}\n"
-        f"📝 عدد التقييمات: {total_ratings}"
-    )
+    report = (f"📊 **إحصائيات التقييمات:**\n\n✨ متوسط التقييم: {avg_str} / 5  {stars}\n📝 عدد التقييمات: {total_ratings}")
     await update.message.reply_text(report, parse_mode='Markdown')
 
 # ------------------------------------------------------------------
@@ -490,13 +561,11 @@ async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wait_msg_id = context.application.bot_data.get(f'wait_msg_{order_id}')
             if wait_msg_id:
                 try:
-                    await context.bot.edit_message_text(chat_id=user_id, message_id=wait_msg_id,
-                        text=user_final_text, parse_mode='Markdown')
+                    await context.bot.edit_message_text(chat_id=user_id, message_id=wait_msg_id, text=user_final_text, parse_mode='Markdown')
                 except Exception:
                     await context.bot.send_message(chat_id=user_id, text=user_final_text, parse_mode='Markdown')
             else:
                 await context.bot.send_message(chat_id=user_id, text=user_final_text, parse_mode='Markdown')
-            # جدولة رسالة التقييم بعد 10 دقائق
             schedule_rating_request(context, user_id, order_id, delay_minutes=10)
         elif data[0] == "out":
             user_id, order_id = data[1], data[2]
@@ -580,11 +649,7 @@ async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid = 0 AND status = 'مقبول' AND location != 'دفع فوري' GROUP BY user_id, location")
         debtors = c.fetchall()
         c.close()
-    report = (f"📔 **دفتر الحسابات (آخر 7 أيام):**\n"
-              f"📦 إجمالي الطلبات: {total_orders} حركة\n"
-              f"💰 المبيعات الكلية: {total_sales} شيكل\n"
-              f"⚡ إجمالي الدفع الفوري: {instant_paid} شيكل\n"
-              f"🔴 إجمالي الديون المعلقة: {total_debts} شيكل\n\n")
+    report = (f"📔 **دفتر الحسابات (آخر 7 أيام):**\n📦 إجمالي الطلبات: {total_orders} حركة\n💰 المبيعات الكلية: {total_sales} شيكل\n⚡ إجمالي الدفع الفوري: {instant_paid} شيكل\n🔴 إجمالي الديون المعلقة: {total_debts} شيكل\n\n")
     keyboard = [[InlineKeyboardButton(f"🔔 {d[1]} ({d[2]} ش)", callback_data=f"remind_{d[0]}_{d[2]}")] for d in debtors]
     if not keyboard:
         report += "✨ لا يوجد ديون معلقة حالياً."
@@ -623,7 +688,6 @@ async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك بنجاح. شكراً لك!")
 
-# --- دالة جديدة لمعالجة النصوص العشوائية من المستخدم ---
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "الرجاء الضغط على زر **البدء (Start)** في الأسفل، أو استخدام **القائمة (الزر الأزرق ☰)** بالجانب لخيارات البدء."
     await update.message.reply_text(text, parse_mode='Markdown')
@@ -652,18 +716,14 @@ def main():
     init_db()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    if app.job_queue is None:
-        logger.warning(
-            "job_queue غير مفعّل — رسائل التقييم لن تُرسَل بعد 10 دقائق. "
-            "ثبّت: pip install 'python-telegram-bot[job-queue]'"
-        )
-
     main_conv = ConversationHandler(
         entry_points=[
             CommandHandler('start', start),
             CommandHandler('pay', start_instant_pay),
             CallbackQueryHandler(customer_handle_edit, pattern="^edit(back|ready)_"),
-            CallbackQueryHandler(settle_start, pattern="^settle_")
+            CallbackQueryHandler(settle_start, pattern="^settle_"),
+            # التقاط النصوص المكتوبة خارج الأوامر وإرسالها للذكاء الاصطناعي
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_order)
         ],
         states={
             ASK_OFFICE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, save_office_and_show_menu)],
@@ -702,7 +762,6 @@ def main():
     app.add_handler(CallbackQueryHandler(send_reminder, pattern="^remind_"))
     app.add_handler(CallbackQueryHandler(clear_debt,    pattern="^clear_"))
     
-    # حماية للرد على أي نصوص عشوائية من المستخدم إذا لم يكن في عملية طلب نشطة
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
 
     app.run_webhook(
