@@ -63,7 +63,6 @@ async def cleanup_old_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if old_msg_id:
         chat_id = update.effective_chat.id
         try:
-            # تحويل الرسالة القديمة لنص ملغي وحذف الأزرار
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=old_msg_id,
@@ -71,7 +70,7 @@ async def cleanup_old_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=None
             )
         except Exception:
-            pass # نتجاهل الخطأ لو الرسالة محذوفة مسبقاً أو قديمة جداً
+            pass 
 
 # --- أمر الإلغاء العام ---
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -83,7 +82,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- مسار الطلب ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cleanup_old_message(update, context) # تنظيف أي رسالة معلقة قبل البدء
+    await cleanup_old_message(update, context) 
     context.user_data.clear()
     context.user_data['cart'] = []
     text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:"
@@ -209,7 +208,7 @@ async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard_user = [[InlineKeyboardButton("❌ التراجع وإلغاء الطلب", callback_data=f"usercancel_{order_id}_{cashier_msg.message_id}")]]
     await query.edit_message_text(f"تم إرسال طلبك المحدث #{order_id} للكاشير. ⏳\n\nفي حال أخطأت أو غيرت رأيك، يمكنك التراجع عنه قبل تأكيد الكاشير:", reply_markup=InlineKeyboardMarkup(keyboard_user))
     
-    context.user_data.clear() # تمت العملية بنجاح، تنظيف الذاكرة
+    context.user_data.clear() 
     return ConversationHandler.END
 
 # ------------------------------------------------------------------
@@ -235,10 +234,10 @@ async def user_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.close()
 
 # ------------------------------------------------------------------
-# ميزة دفع فاتورة فورية
+# مسار الدفع الفوري (تم تطوير الواجهة والتنظيف)
 # ------------------------------------------------------------------
 async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cleanup_old_message(update, context) # تنظيف أي رسالة معلقة قبل البدء
+    await cleanup_old_message(update, context) 
     context.user_data.clear() 
     text = "كم قيمة الفاتورة اللي حابب تدفعها؟ هذه المعلومة مهمة للحسابات داخليا. اكتب الرقم مثلا (15)"
     msg = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]]))
@@ -247,18 +246,58 @@ async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount_val = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    
+    # 1. مسح رسالة البوت القديمة لتنظيف الشات
+    old_msg_id = context.user_data.get('last_msg_id')
+    if old_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+        except Exception:
+            pass
+            
+    # محاولة مسح رسالة الزبون (اللي فيها الرقم) لتنظيف الشات بالكامل (ستعمل إذا كان البوت أدمن أو في الرسائل المباشرة)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     if not amount_val.isdigit():
-        msg = await update.message.reply_text("⚠️ خطأ: الرجاء كتابة أرقام فقط (مثال: 15). حاول مجدداً:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]]))
+        msg = await context.bot.send_message(chat_id=chat_id, text="⚠️ خطأ: الرجاء كتابة أرقام فقط (مثال: 15). حاول مجدداً:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]]))
         context.user_data['last_msg_id'] = msg.message_id
         return PAY_AMOUNT 
 
     context.user_data['pay_amount'] = amount_val
-    text = f"تمام. ارفع الإشعار بعد اذنك بالمبلغ ({amount_val})."
-    msg = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]]))
+    text = f"تمام. ارفع الإشعار بعد اذنك بالمبلغ ({amount_val}) شيكل."
+    
+    # إضافة زر تعديل الرقم
+    keyboard = [
+        [InlineKeyboardButton("✏️ تعديل الرقم", callback_data="editpay")],
+        [InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]
+    ]
+    
+    msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
     context.user_data['last_msg_id'] = msg.message_id
     return PAY_RECEIPT
 
+# دالة العودة لتعديل الرقم
+async def edit_pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    text = "كم قيمة الفاتورة اللي حابب تدفعها؟ هذه المعلومة مهمة للحسابات داخليا. اكتب الرقم مثلا (15)"
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية", callback_data="cancelpay")]]))
+    # last_msg_id يبقى كما هو لأننا عدلنا نفس الرسالة
+    return PAY_AMOUNT
+
 async def get_pay_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # مسح أزرار رفع الصورة بعد الاستلام لتنظيف الشات
+    old_msg_id = context.user_data.get('last_msg_id')
+    if old_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=old_msg_id)
+        except Exception:
+            pass
+
     user = update.message.from_user; amt = int(context.user_data.get('pay_amount', 0))
     with get_db() as conn:
         c = conn.cursor()
@@ -277,7 +316,7 @@ async def cancel_pay_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ------------------------------------------------------------------
-# صفحة "ديوني" 
+# صفحة "ديوني" (للزبون)
 # ------------------------------------------------------------------
 async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -339,8 +378,6 @@ async def remove_item_from_order(update: Update, context: ContextTypes.DEFAULT_T
     keyboard = [[InlineKeyboardButton("➕ إضافة أصناف بديلة", callback_data=f"editback_{order_id}")],
                 [InlineKeyboardButton("✅ إرسال الطلب المتبقي", callback_data=f"editready_{order_id}")]]
     msg = await context.bot.send_message(chat_id=user_id, text=f"⚠️ عذراً، ({removed_item}) غير متوفر.\nسلتك الحالية: {new_details}\n\nحابب تضيف بديل ولا نعتمد هيك؟", reply_markup=InlineKeyboardMarkup(keyboard))
-    # يمكننا حفظ هذه الرسالة كآخر رسالة تفاعلية للزبون لتنظيفها لو ألغى
-    # لكن بما أننا لا نملك وصولاً مباشراً لـ context.user_data الخاص بالزبون من هنا (نحن في سياق الكاشير)، سنكتفي بإرسالها.
 
 async def customer_handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data.split("_")
@@ -353,27 +390,50 @@ async def customer_handle_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         
     context.user_data['cart'] = [it.strip() for it in res[0].split(",")] if res[0] else []
     context.user_data['editing_order_id'] = order_id
-    context.user_data['last_msg_id'] = query.message.message_id # حفظ للتنظيف
+    context.user_data['last_msg_id'] = query.message.message_id 
     if action == "editback": return await show_categories(update, context)
     else:
         keyboard = [[InlineKeyboardButton("توصيل للمكتب 🖥️", callback_data='loc_office')], [InlineKeyboardButton("حجز بالمكان 🪑", callback_data='loc_place')]]
         await query.edit_message_text("تأكيد مكان الاستلام:", reply_markup=InlineKeyboardMarkup(keyboard))
         return LOCATION_TYPE
 
-# --- الإدارة ---
+# --- الإدارة (للكاشير فقط - دفتر مفصل) ---
 async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID: return
     week_ago = (datetime.utcnow() + timedelta(hours=3) - timedelta(days=7)).strftime("%Y-%m-%d")
     with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT COUNT(*), SUM(total_price) FROM orders WHERE timestamp >= %s AND status != 'ملغي'", (week_ago,))
-        res = c.fetchone()
-        c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid=0 AND status='مقبول' GROUP BY user_id, location")
+        
+        # 1. إجمالي الطلبات والمبيعات الكلية (فقط المقبولة)
+        c.execute("SELECT COUNT(*), SUM(total_price) FROM orders WHERE timestamp >= %s AND status = 'مقبول'", (week_ago,))
+        res_total = c.fetchone()
+        total_orders = res_total[0] or 0
+        total_sales = res_total[1] or 0
+        
+        # 2. الفواتير الفورية (الدفع الفوري)
+        c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= %s AND location = 'دفع فوري'", (week_ago,))
+        instant_paid = c.fetchone()[0] or 0
+        
+        # 3. الديون المعلقة (الطلبات المقبولة، لم تدفع، وليست دفع فوري)
+        c.execute("SELECT SUM(total_price) FROM orders WHERE timestamp >= %s AND is_paid = 0 AND status = 'مقبول' AND location != 'دفع فوري'", (week_ago,))
+        total_debts = c.fetchone()[0] or 0
+        
+        # 4. قائمة المديونين للزر
+        c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid = 0 AND status = 'مقبول' AND location != 'دفع فوري' GROUP BY user_id, location")
         debtors = c.fetchall()
         c.close()
         
+    report = f"📔 **دفتر الحسابات (آخر 7 أيام):**\n"
+    report += f"📦 إجمالي الطلبات: {total_orders} حركة\n"
+    report += f"💰 المبيعات الكلية: {total_sales} شيكل\n"
+    report += f"⚡ إجمالي الدفع الفوري: {instant_paid} شيكل\n"
+    report += f"🔴 إجمالي الديون المعلقة: {total_debts} شيكل\n\n"
+    
     keyboard = [[InlineKeyboardButton(f"🔔 {d[1]} ({d[2]} ش)", callback_data=f"remind_{d[0]}_{d[2]}")] for d in debtors]
-    await update.message.reply_text(f"📔 الحسابات:\n📦 طلبات: {res[0] or 0}\n💰 مبيعات: {res[1] or 0} ش", reply_markup=InlineKeyboardMarkup(keyboard))
+    if not keyboard:
+        report += "✨ لا يوجد ديون معلقة حالياً."
+        
+    await update.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); user_id = query.data.split("_")[1]
@@ -407,7 +467,12 @@ def main():
             CONFIRMING_CART: [CallbackQueryHandler(confirm_cart, pattern="^(remove_\d+|add_more|confirm_order|cancel_order)$")], 
             LOCATION_TYPE: [CallbackQueryHandler(location_choice, pattern="^loc_")],
             PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pay_amount), CallbackQueryHandler(cancel_pay_flow, pattern="^cancelpay$")], 
-            PAY_RECEIPT: [MessageHandler(filters.PHOTO | filters.Document.ALL, get_pay_receipt), CallbackQueryHandler(cancel_pay_flow, pattern="^cancelpay$")]
+            # تم إضافة زر تعديل الرقم في سياق رفع الصورة
+            PAY_RECEIPT: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, get_pay_receipt), 
+                CallbackQueryHandler(cancel_pay_flow, pattern="^cancelpay$"),
+                CallbackQueryHandler(edit_pay_amount, pattern="^editpay$")
+            ]
         },
         fallbacks=[
             CommandHandler('start', start), 
