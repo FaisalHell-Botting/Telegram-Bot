@@ -226,7 +226,7 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wait_msg = await update.message.reply_text("🤖 جاري فهم طلبك...")
 
     try:
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         prompt = f"""
         أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من رسالة الزبون التالية: '{user_text}'
         قائمة الأصناف المتاحة حرفياً: {list(PRICES.keys())}
