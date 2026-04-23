@@ -90,7 +90,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_OFFICE
 
 async def save_office_and_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['office'] = f"مكتب {update.message.text}"
+    user_text = update.message.text.strip()
+    
+    # حماية لمنع إدخال الكلمات العشوائية أو الأوامر في مكان رقم المكتب
+    if "منيو" in user_text or len(user_text) > 15:
+        await update.message.reply_text("⚠️ الرجاء كتابة رقم أو اسم مكتب صحيح (مثال: 15):")
+        return ASK_OFFICE
+
+    context.user_data['office'] = f"مكتب {user_text}"
     return await show_categories(update, context)
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -616,6 +623,11 @@ async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك بنجاح. شكراً لك!")
 
+# --- دالة جديدة لمعالجة النصوص العشوائية من المستخدم ---
+async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "الرجاء الضغط على زر **البدء (Start)** في الأسفل، أو استخدام **القائمة (الزر الأزرق ☰)** بالجانب لخيارات البدء."
+    await update.message.reply_text(text, parse_mode='Markdown')
+
 # --- بدء البوت ---
 async def post_init(application: Application):
     try:
@@ -689,6 +701,9 @@ def main():
     app.add_handler(CommandHandler('ratings',      admin_ratings))
     app.add_handler(CallbackQueryHandler(send_reminder, pattern="^remind_"))
     app.add_handler(CallbackQueryHandler(clear_debt,    pattern="^clear_"))
+    
+    # حماية للرد على أي نصوص عشوائية من المستخدم إذا لم يكن في عملية طلب نشطة
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
 
     app.run_webhook(
         listen="0.0.0.0",
