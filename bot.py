@@ -119,13 +119,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_office_and_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     
-    if "منيو" in user_text or len(user_text) > 15:
+    # إذا كتب الزبون جملة طويلة (طلب كامل) وهو في خطوة طلب المكتب، حوّلها للذكاء الاصطناعي فوراً
+    if len(user_text) > 15 or "بدي" in user_text:
+        return await handle_ai_order(update, context)
+
+    # حماية لمنع إدخال كلمة منيو في مكان رقم المكتب
+    if "منيو" in user_text:
         await update.message.reply_text("⚠️ الرجاء كتابة رقم أو اسم مكتب صحيح (مثال: 15):")
         return ASK_OFFICE
 
     context.user_data['office'] = f"مكتب {user_text}"
     
-    # إذا كان هناك سلة ممتلئة مسبقاً (جاءت من الـ AI ولم يكن المكتب محدداً)
+    # إذا كان هناك سلة ممتلئة مسبقاً
     if context.user_data.get('cart'):
         return await show_cart_ui(update, context, "✅ تم حفظ رقم المكتب بنجاح.")
         
