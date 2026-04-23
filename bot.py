@@ -221,20 +221,26 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wait_msg = await update.message.reply_text("🤖 جاري فهم طلبك...")
 
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
+        model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"""
         أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من رسالة الزبون التالية: '{user_text}'
         قائمة الأصناف المتاحة حرفياً: {list(PRICES.keys())}
         القواعد:
-        1. طابق الأصناف مع القائمة المتاحة فقط.
+        1. طابق الأصناف مع القائمة المتاحة فقط بناءً على أقرب معنى.
         2. إذا طلب كمية (مثلا 2 قهوة وسط)، كرر اسم الصنف في المصفوفة مرتين.
         3. إذا طلب شيئاً غير متوفر، ضعه في مصفوفة unmatched.
         4. استخرج رقم المكتب إذا ذكره الزبون (أرقام فقط)، وإلا اجعله null.
-        يجب أن يكون الرد بصيغة JSON فقط بهذا الهيكل:
+        يجب أن يكون الرد بصيغة JSON فقط بهذا الهيكل الدقيق:
         {{"office": "15", "items": ["شاي", "قهوة مزاج وسط", "قهوة مزاج وسط"], "unmatched": ["عصير رمان"]}}
+        تحذير: لا تقم بإضافة أي نصوص أو علامات Markdown مثل ```json حول الرد.
         """
-        response = model.generate_content(prompt)
-        data = json.loads(response.text)
+        
+        # استخدام دالة الـ Async لعدم إيقاف سيرفر التيليجرام
+        response = await model.generate_content_async(prompt)
+        
+        # تنظيف الرد من أي علامات Markdown قد تسبب خطأ في الترجمة
+        clean_text = response.text.replace('```json', '').replace('```', '').strip()
+        data = json.loads(clean_text)
 
         items = data.get("items", [])
         unmatched = data.get("unmatched", [])
@@ -269,7 +275,8 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Gemini Error: {e}")
         await wait_msg.delete()
-        await unknown_text(update, context)
+        # إرسال رسالة الخطأ البرمجي لك على التيليجرام عشان نحدد المشكلة لو تكررت
+        await update.message.reply_text(f"⚠️ حدث خطأ أثناء معالجة البيانات:\n`{str(e)}`\n\nالرجاء استخدام الأزرار مؤقتاً.", parse_mode='Markdown')
         return ConversationHandler.END
 
 
