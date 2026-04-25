@@ -212,7 +212,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
     context.user_data.clear()
     context.user_data['cart'] = []
-    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(أو يمكنك إرسال بصمة صوتية أو نص بطلبك مباشرة، مثلاً: بدي 2 قهوة وسط لمكتب 15)*"
+    
+    # هنا تم تعديل الرسالة الترحيبية حسب طلبك
+    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(كمان يمكنك الطلب من خلال تسجيل صوتي أو الكتابة نص مباشرة, مثلا: بدي 2 قهوة وسط لمكتب رقم 216)*"
+    
     if update.message:
         msg = await update.message.reply_text(text, parse_mode='Markdown')
         context.user_data['last_msg_id'] = msg.message_id
