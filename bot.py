@@ -5,6 +5,7 @@ import asyncio
 import os
 import json
 import random
+from gtts import gTTS  # مكتبة تحويل النص إلى صوت
 import google.generativeai as genai
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -22,9 +23,9 @@ PORT = int(os.environ.get('PORT', 8443))
 
 WALLET_NUMBER = os.environ.get('WALLET_NUMBER', '0597489605')
 
-# إعداد مفاتيح Gemini (يدعم مفتاح واحد أو عدة مفاتيح مفصولة بفاصلة)
+# إعداد مفاتيح Gemini وتجاهل أي مسافات أو فواصل فارغة
 GEMINI_KEYS_ENV = os.environ.get('GEMINI_API_KEY', '')
-GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_ENV.split(',')] if GEMINI_KEYS_ENV else []
+GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_ENV.split(',') if k.strip()] if GEMINI_KEYS_ENV else []
 
 PRICES = {
     'شاي': 1, 'قهوة مزاج وسط': 2, 'قهوة مزاج كبير': 3, 'نسكافيه مكس': 2, 'كفي مكس': 2, 'كابتشينو جوداي': 3,
@@ -99,7 +100,7 @@ async def show_cart_ui(update: Update, context: ContextTypes.DEFAULT_TYPE, base_
     return CONFIRMING_CART
 
 # ------------------------------------------------------------------
-# ===== ذكاء اصطناعي: التقاط الطلب الحر عبر Gemini مع تدوير المفاتيح =====
+# ===== ذكاء اصطناعي: التقاط الطلب الحر (نص فقط) =====
 # ------------------------------------------------------------------
 async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
@@ -112,8 +113,8 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         genai.configure(api_key=random.choice(GEMINI_KEYS))
-        
         model = genai.GenerativeModel('gemini-2.5-flash')
+        
         prompt = f"""
         أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من رسالة الزبون التالية: '{user_text}'
         قائمة الأصناف المتاحة حرفياً: {list(PRICES.keys())}
@@ -162,14 +163,17 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         error_msg = str(e).lower()
-        await wait_msg.delete()
+        try:
+            await wait_msg.delete()
+        except:
+            pass
         
         if any(x in error_msg for x in ["429", "quota", "limit", "exhausted"]):
             await update.message.reply_text("🤖 المساعد الذكي مشغول حالياً! تفضل المنيو السريع لخدمتك فوراً 👇")
             return await show_categories(update, context)
         
         logger.error(f"Gemini Error: {e}")
-        await update.message.reply_text("⚠️ المعذرة، لم أتمكن من معالجة الطلب نصياً. الرجاء استخدام الأزرار 👇")
+        await update.message.reply_text(f"⚠️ خطأ في معالجة الطلب:\n`{str(e)}`\n\nالرجاء استخدام الأزرار مؤقتاً.", parse_mode='Markdown')
         return await show_categories(update, context)
 
 # ------------------------------------------------------------------
@@ -187,7 +191,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
     context.user_data.clear()
     context.user_data['cart'] = []
-    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(أو يمكنك كتابة طلبك مباشرة، مثلاً: بدي 2 قهوة وسط لمكتب 15)*"
+    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(كمان يمكنك الطلب من خلال الكتابة نص مباشرة, مثلا: بدي 2 قهوة وسط لمكتب رقم 216)*"
     if update.message:
         msg = await update.message.reply_text(text, parse_mode='Markdown')
         context.user_data['last_msg_id'] = msg.message_id
@@ -288,6 +292,7 @@ async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = sum(PRICES[item] for item in cart)
     db_location = office
     delivery_type = "توصيل" if query.data == 'loc_office' else "في الكوفي كورنر"
+    
     with get_db() as conn:
         c = conn.cursor()
         editing_id = context.user_data.get('editing_order_id')
@@ -301,13 +306,41 @@ async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order_id = c.fetchone()[0]
         conn.commit()
         c.close()
+
     keyboard_cashier = [
         [InlineKeyboardButton("✅ تأكيد", callback_data=f"conf_{user.id}_{order_id}")],
         [InlineKeyboardButton("⚠️ صنف ناقص", callback_data=f"out_{user.id}_{order_id}")]
     ]
+    
+    # إرسال الرسالة النصية للكاشير
     cashier_msg = await context.bot.send_message(chat_id=CASHIER_ID,
         text=f"🚨 **طلب #{order_id}**\n👤 {user.first_name}\n📦 {details}\n📍 {office} ({delivery_type})\n💰 {total} ش",
         reply_markup=InlineKeyboardMarkup(keyboard_cashier), parse_mode='Markdown')
+
+    # === ميزة القراءة الصوتية للكاشير ===
+    try:
+        # تجهيز النص المكتوب ليقرأه البوت بوضوح
+        audio_text = f"طلب جديد. {office}. الأصناف المطلوبة هي: {details}."
+        
+        # تحويل النص لصوت وحفظه بصيغة mp3 الصحيحة
+        tts = gTTS(text=audio_text, lang='ar', slow=False)
+        audio_file_name = f"order_{order_id}.mp3"
+        tts.save(audio_file_name)
+        
+        # إرسال التسجيل الصوتي كـ Audio ليقبله تيليجرام
+        with open(audio_file_name, 'rb') as audio:
+            await context.bot.send_audio(chat_id=CASHIER_ID, audio=audio)
+            
+        # حذف الملف من السيرفر بعد الإرسال لتوفير المساحة
+        if os.path.exists(audio_file_name):
+            os.remove(audio_file_name)
+            
+    except Exception as e:
+        logger.error(f"Error generating voice for cashier: {e}")
+        # عشان لو صار خطأ نعرفه فوراً
+        await context.bot.send_message(chat_id=CASHIER_ID, text=f"⚠️ مشكلة في توليد الصوت: {str(e)}")
+    # ==================================
+
     keyboard_user = [[InlineKeyboardButton("❌ التراجع وإلغاء الطلب", callback_data=f"usercancel_{order_id}_{cashier_msg.message_id}")]]
     await query.edit_message_text(
         f"تم إرسال طلبك #{order_id} للكاشير. ⏳\n\nفي حال أخطأت أو غيرت رأيك، يمكنك التراجع عنه قبل تأكيد الكاشير:",
