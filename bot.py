@@ -4,6 +4,7 @@ import logging
 import asyncio
 import os
 import json
+import random
 import google.generativeai as genai
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -21,10 +22,9 @@ PORT = int(os.environ.get('PORT', 8443))
 
 WALLET_NUMBER = os.environ.get('WALLET_NUMBER', '0597489605')
 
-# إعداد الذكاء الاصطناعي Gemini
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# إعداد مفاتيح Gemini (يدعم مفتاح واحد أو عدة مفاتيح مفصولة بفاصلة)
+GEMINI_KEYS_ENV = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_ENV.split(',')] if GEMINI_KEYS_ENV else []
 
 PRICES = {
     'شاي': 1, 'قهوة مزاج وسط': 2, 'قهوة مزاج كبير': 3, 'نسكافيه مكس': 2, 'كفي مكس': 2, 'كابتشينو جوداي': 3,
@@ -79,7 +79,6 @@ async def cleanup_old_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
 
-# --- Helper Function لعرض السلة بشكل موحد ---
 async def show_cart_ui(update: Update, context: ContextTypes.DEFAULT_TYPE, base_text=""):
     cart = context.user_data.get('cart', [])
     total = sum(PRICES[item] for item in cart)
@@ -99,6 +98,84 @@ async def show_cart_ui(update: Update, context: ContextTypes.DEFAULT_TYPE, base_
         context.user_data['last_msg_id'] = msg.message_id
     return CONFIRMING_CART
 
+# ------------------------------------------------------------------
+# ===== ذكاء اصطناعي: التقاط الطلب الحر عبر Gemini مع تدوير المفاتيح =====
+# ------------------------------------------------------------------
+async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip()
+    
+    if len(user_text) < 3 or not GEMINI_KEYS:
+        await unknown_text(update, context)
+        return ConversationHandler.END
+
+    wait_msg = await update.message.reply_text("🤖 جاري فهم طلبك...")
+
+    try:
+        genai.configure(api_key=random.choice(GEMINI_KEYS))
+        
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        prompt = f"""
+        أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من رسالة الزبون التالية: '{user_text}'
+        قائمة الأصناف المتاحة حرفياً: {list(PRICES.keys())}
+        القواعد:
+        1. طابق الأصناف مع القائمة المتاحة فقط بناءً على أقرب معنى.
+        2. إذا طلب كمية (مثلا 2 قهوة وسط)، كرر اسم الصنف في المصفوفة مرتين.
+        3. إذا طلب شيئاً غير متوفر، ضعه في مصفوفة unmatched.
+        4. استخرج رقم المكتب إذا ذكره الزبون (أرقام فقط)، وإلا اجعله null.
+        يجب أن يكون الرد بصيغة JSON فقط بهذا الهيكل الدقيق:
+        {{"office": "15", "items": ["شاي", "قهوة مزاج وسط", "قهوة مزاج وسط"], "unmatched": ["عصير رمان"]}}
+        تحذير: لا تقم بإضافة أي نصوص أو علامات Markdown مثل ```json حول الرد.
+        """
+        
+        response = await model.generate_content_async(prompt)
+        clean_text = response.text.replace('```json', '').replace('```', '').strip()
+        data = json.loads(clean_text)
+
+        items = data.get("items", [])
+        unmatched = data.get("unmatched", [])
+        office = data.get("office")
+
+        await wait_msg.delete()
+
+        if not items and not unmatched:
+            await unknown_text(update, context)
+            return ConversationHandler.END
+
+        context.user_data['cart'] = items
+        reply_text = ""
+        
+        if unmatched:
+            reply_text += f"⚠️ المعذرة، هذه الأصناف غير متوفرة لدينا: {', '.join(unmatched)}\n"
+
+        if items:
+            if office:
+                context.user_data['office'] = f"مكتب {office}"
+                return await show_cart_ui(update, context, reply_text + "🤖 فهمت طلبك تماماً!")
+            else:
+                reply_text += "🤖 فهمت الأصناف المطلوبة، لكن **ما هو رقم مكتبك؟** الرجاء كتابته الآن:"
+                msg = await update.message.reply_text(reply_text)
+                context.user_data['last_msg_id'] = msg.message_id
+                return ASK_OFFICE
+        else:
+            await update.message.reply_text(reply_text + "\nلم أجد أصنافاً متاحة في طلبك، يرجى المحاولة عبر القوائم.")
+            return await show_categories(update, context)
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        await wait_msg.delete()
+        
+        if any(x in error_msg for x in ["429", "quota", "limit", "exhausted"]):
+            await update.message.reply_text("🤖 المساعد الذكي مشغول حالياً! تفضل المنيو السريع لخدمتك فوراً 👇")
+            return await show_categories(update, context)
+        
+        logger.error(f"Gemini Error: {e}")
+        await update.message.reply_text("⚠️ المعذرة، لم أتمكن من معالجة الطلب نصياً. الرجاء استخدام الأزرار 👇")
+        return await show_categories(update, context)
+
+# ------------------------------------------------------------------
+# بقية دوال المحادثة والطلب
+# ------------------------------------------------------------------
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
     if update.message:
@@ -110,7 +187,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
     context.user_data.clear()
     context.user_data['cart'] = []
-    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(أو يمكنك كتابة طلبك مباشرة، مثلاً: بدي 2 قهوة وسط لمكتب 212)*"
+    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(أو يمكنك كتابة طلبك مباشرة، مثلاً: بدي 2 قهوة وسط لمكتب 15)*"
     if update.message:
         msg = await update.message.reply_text(text, parse_mode='Markdown')
         context.user_data['last_msg_id'] = msg.message_id
@@ -119,21 +196,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_office_and_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     
-    # إذا كتب الزبون جملة طويلة (طلب كامل) وهو في خطوة طلب المكتب، حوّلها للذكاء الاصطناعي فوراً
     if len(user_text) > 15 or "بدي" in user_text:
         return await handle_ai_order(update, context)
 
-    # حماية لمنع إدخال كلمة منيو في مكان رقم المكتب
     if "منيو" in user_text:
         await update.message.reply_text("⚠️ الرجاء كتابة رقم أو اسم مكتب صحيح (مثال: 15):")
         return ASK_OFFICE
 
     context.user_data['office'] = f"مكتب {user_text}"
-    
-    # إذا كان هناك سلة ممتلئة مسبقاً
     if context.user_data.get('cart'):
         return await show_cart_ui(update, context, "✅ تم حفظ رقم المكتب بنجاح.")
-        
     return await show_categories(update, context)
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -178,7 +250,6 @@ async def service_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith('item_'):
         item_name = query.data.replace('item_', '')
         context.user_data.setdefault('cart', []).append(item_name)
-    
     return await show_cart_ui(update, context)
 
 async def confirm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,19 +258,14 @@ async def confirm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == 'add_more':
         return await show_categories(update, context)
     elif query.data == 'cancel_order':
-        await query.edit_message_text("✅ تم إلغاء الطلب. بإمكانك طلب شيء آخر في أي وقت.")
+        await query.edit_message_text("✅ تم إلغاء الطلب.")
         context.user_data.clear()
         return ConversationHandler.END
     elif query.data.startswith('remove_'):
         idx = int(query.data.split('_')[1])
-        if 0 <= idx < len(context.user_data.get('cart', [])):
-            context.user_data['cart'].pop(idx)
-        if not context.user_data.get('cart'):
-            await query.edit_message_text("سلتك فارغة الآن. الرجاء اختيار قسم من جديد:")
-            return await show_categories(update, context)
-        
+        if 0 <= idx < len(context.user_data.get('cart', [])): context.user_data['cart'].pop(idx)
+        if not context.user_data.get('cart'): return await show_categories(update, context)
         return await show_cart_ui(update, context)
-        
     elif query.data == 'confirm_order':
         has_sandwich = any("سندويش" in item for item in context.user_data.get('cart', []))
         office = context.user_data.get('office', 'مكتبك')
@@ -210,80 +276,7 @@ async def confirm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if has_sandwich:
             keyboard = [[InlineKeyboardButton("في الكوفي كورنر 🪑", callback_data='loc_place')]]
         await query.edit_message_text(text="وين حابب تستلم؟", reply_markup=InlineKeyboardMarkup(keyboard))
-        context.user_data['last_msg_id'] = query.message.message_id
         return LOCATION_TYPE
-
-# ------------------------------------------------------------------
-# ===== ذكاء اصطناعي: التقاط الطلب الحر عبر Gemini =====
-# ------------------------------------------------------------------
-async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.strip()
-    
-    if len(user_text) < 3 or not GEMINI_API_KEY:
-        await unknown_text(update, context)
-        return ConversationHandler.END
-
-    wait_msg = await update.message.reply_text("🤖 جاري فهم طلبك...")
-
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        prompt = f"""
-        أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من رسالة الزبون التالية: '{user_text}'
-        قائمة الأصناف المتاحة حرفياً: {list(PRICES.keys())}
-        القواعد:
-        1. طابق الأصناف مع القائمة المتاحة فقط بناءً على أقرب معنى.
-        2. إذا طلب كمية (مثلا 2 قهوة وسط)، كرر اسم الصنف في المصفوفة مرتين.
-        3. إذا طلب شيئاً غير متوفر، ضعه في مصفوفة unmatched.
-        4. استخرج رقم المكتب إذا ذكره الزبون (أرقام فقط)، وإلا اجعله null.
-        يجب أن يكون الرد بصيغة JSON فقط بهذا الهيكل الدقيق:
-        {{"office": "15", "items": ["شاي", "قهوة مزاج وسط", "قهوة مزاج وسط"], "unmatched": ["عصير رمان"]}}
-        تحذير: لا تقم بإضافة أي نصوص أو علامات Markdown مثل ```json حول الرد.
-        """
-        
-        # استخدام دالة الـ Async لعدم إيقاف سيرفر التيليجرام
-        response = await model.generate_content_async(prompt)
-        
-        # تنظيف الرد من أي علامات Markdown قد تسبب خطأ في الترجمة
-        clean_text = response.text.replace('```json', '').replace('```', '').strip()
-        data = json.loads(clean_text)
-
-        items = data.get("items", [])
-        unmatched = data.get("unmatched", [])
-        office = data.get("office")
-
-        await wait_msg.delete()
-
-        if not items and not unmatched:
-            await unknown_text(update, context)
-            return ConversationHandler.END
-
-        # تحديث بيانات السلة
-        context.user_data['cart'] = items
-        reply_text = ""
-        
-        if unmatched:
-            reply_text += f"⚠️ المعذرة، هذه الأصناف غير متوفرة لدينا: {', '.join(unmatched)}\n"
-
-        if items:
-            if office:
-                context.user_data['office'] = f"مكتب {office}"
-                return await show_cart_ui(update, context, reply_text + "🤖 فهمت طلبك تماماً!")
-            else:
-                reply_text += "🤖 فهمت الأصناف المطلوبة، لكن **ما هو رقم مكتبك؟** الرجاء كتابته الآن:"
-                msg = await update.message.reply_text(reply_text)
-                context.user_data['last_msg_id'] = msg.message_id
-                return ASK_OFFICE
-        else:
-            await update.message.reply_text(reply_text + "\nلم أجد أصنافاً متاحة في طلبك، يرجى المحاولة عبر الأزرار.")
-            return ConversationHandler.END
-
-    except Exception as e:
-        logger.error(f"Gemini Error: {e}")
-        await wait_msg.delete()
-        # إرسال رسالة الخطأ البرمجي لك على التيليجرام عشان نحدد المشكلة لو تكررت
-        await update.message.reply_text(f"⚠️ حدث خطأ أثناء معالجة البيانات:\n`{str(e)}`\n\nالرجاء استخدام الأزرار مؤقتاً.", parse_mode='Markdown')
-        return ConversationHandler.END
-
 
 async def location_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -346,6 +339,102 @@ async def user_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"⚠️ لا يمكنك إلغاء الطلب #{order_id} لأنه قيد التحضير وتم قبوله أو تعديله من الكاشير.")
         c.close()
+
+async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != CASHIER_ID:
+        await query.answer("⛔ غير مصرح لك بهذا الإجراء.", show_alert=True)
+        return
+    data = query.data.split("_")
+    with get_db() as conn:
+        c = conn.cursor()
+        if data[0] == "conf":
+            user_id, order_id = int(data[1]), int(data[2])
+            c.execute("UPDATE orders SET status='مقبول' WHERE id=%s", (order_id,))
+            c.execute("SELECT details FROM orders WHERE id=%s", (order_id,))
+            details = c.fetchone()[0]
+            conn.commit()
+            await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد.")
+            user_final_text = f"✅ **تم تأكيد طلبك!**\n📦 {details}\n📝 تم إضافة الطلب على دفتر الدين.\nصحة وهنا! ❤️"
+            wait_msg_id = context.application.bot_data.get(f'wait_msg_{order_id}')
+            if wait_msg_id:
+                try:
+                    await context.bot.edit_message_text(chat_id=user_id, message_id=wait_msg_id,
+                        text=user_final_text, parse_mode='Markdown')
+                except Exception:
+                    await context.bot.send_message(chat_id=user_id, text=user_final_text, parse_mode='Markdown')
+            else:
+                await context.bot.send_message(chat_id=user_id, text=user_final_text, parse_mode='Markdown')
+            schedule_rating_request(context, user_id, order_id, delay_minutes=10)
+        elif data[0] == "out":
+            user_id, order_id = data[1], data[2]
+            c.execute("SELECT details FROM orders WHERE id=%s", (order_id,))
+            items = [it.strip() for it in c.fetchone()[0].split(",")]
+            keyboard = [[InlineKeyboardButton(f"❌ {it} غير متوفر", callback_data=f"rmv_{user_id}_{order_id}_{i}")] for i, it in enumerate(items)]
+            await query.edit_message_text(f"اختار الصنف الناقص في طلب #{order_id}:", reply_markup=InlineKeyboardMarkup(keyboard))
+        c.close()
+
+async def remove_item_from_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != CASHIER_ID:
+        await query.answer("⛔ غير مصرح لك بهذا الإجراء.", show_alert=True)
+        return
+    data = query.data.split("_")
+    user_id, order_id, item_idx = int(data[1]), int(data[2]), int(data[3])
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT details FROM orders WHERE id=%s", (order_id,))
+        items = [it.strip() for it in c.fetchone()[0].split(",")]
+        removed_item = items.pop(item_idx)
+        new_details = ", ".join(items)
+        new_total = sum(PRICES.get(it, 0) for it in items)
+        c.execute("UPDATE orders SET details=%s, total_price=%s, status='تعديل زبون' WHERE id=%s",
+                  (new_details, new_total, order_id))
+        conn.commit()
+        c.close()
+    await query.edit_message_text(f"⚠️ تم إبلاغ الزبون بنقص ({removed_item}).")
+    wait_msg_id = context.application.bot_data.get(f'wait_msg_{order_id}')
+    if wait_msg_id:
+        try: await context.bot.delete_message(chat_id=user_id, message_id=wait_msg_id)
+        except Exception: pass
+    keyboard = [
+        [InlineKeyboardButton("➕ إضافة أصناف بديلة", callback_data=f"editback_{order_id}")],
+        [InlineKeyboardButton("✅ إرسال الطلب المتبقي", callback_data=f"editready_{order_id}")]
+    ]
+    await context.bot.send_message(chat_id=user_id,
+        text=f"⚠️ عذراً، ({removed_item}) غير متوفر.\nسلتك الحالية: {new_details}\n\nحابب تضيف بديل ولا نعتمد هيك؟",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def customer_handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split("_")
+    action, order_id = data[0], int(data[1])
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT details, location FROM orders WHERE id=%s", (order_id,))
+        res = c.fetchone()
+        c.close()
+    context.user_data['cart'] = [it.strip() for it in res[0].split(",")] if res[0] else []
+    context.user_data['editing_order_id'] = order_id
+    context.user_data['last_msg_id'] = query.message.message_id
+    if res[1] and "مكتب" in res[1]:
+        context.user_data['office'] = res[1]
+    if action == "editback":
+        return await show_categories(update, context)
+    else:
+        keyboard = [
+            [InlineKeyboardButton("توصيل للمكتب 🖥️", callback_data='loc_office')],
+            [InlineKeyboardButton("في الكوفي كورنر 🪑", callback_data='loc_place')]
+        ]
+        await query.edit_message_text("تأكيد مكان الاستلام:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return LOCATION_TYPE
+
+# ------------------------------------------------------------------
+# دوال الدفع والتسديد والديون
+# ------------------------------------------------------------------
 
 async def start_instant_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
@@ -473,177 +562,6 @@ async def user_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report += f"📅 {r[1]} | 💰 {r[2]} ش\n📦 {r[3]}\n" + "⎯" * 10 + "\n"
     await update.message.reply_text(report, parse_mode='Markdown')
 
-# ------------------------------------------------------------------
-# ===== نظام التقييم (مع تأخير 10 دقائق) =====
-# ------------------------------------------------------------------
-
-async def _send_rating_job(context: ContextTypes.DEFAULT_TYPE):
-    """مهمة مجدولة — تُرسَل بعد 10 دقائق من تأكيد الكاشير للطلب."""
-    user_id  = context.job.data['user_id']
-    order_id = context.job.data['order_id']
-    keyboard = [
-        [InlineKeyboardButton("🌟 ممتاز وسريع، رائع!!", callback_data=f"rate_5_{order_id}")],
-        [InlineKeyboardButton("😊 كويس",               callback_data=f"rate_4_{order_id}")],
-        [InlineKeyboardButton("😐 عادي",               callback_data=f"rate_3_{order_id}")],
-        [InlineKeyboardButton("🐢 بطيء",               callback_data=f"rate_2_{order_id}")],
-        [InlineKeyboardButton("😤 بصراحة مش نافع",    callback_data=f"rate_1_{order_id}")]
-    ]
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"⭐ كيف كانت تجربتك في هذه العملية؟\nطلب #{order_id}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    except Exception as e:
-        logger.warning(f"تعذر إرسال طلب التقييم للمستخدم {user_id}: {e}")
-
-def schedule_rating_request(context: ContextTypes.DEFAULT_TYPE, user_id: int, order_id: int, delay_minutes: int = 10):
-    """جدولة رسالة التقييم بعد delay_minutes دقيقة"""
-    if context.application.job_queue is None:
-        return
-    context.application.job_queue.run_once(
-        _send_rating_job,
-        when=delay_minutes * 60,
-        data={'user_id': user_id, 'order_id': order_id},
-        name=f"rating_{order_id}"
-    )
-
-async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة تقييم الزبون"""
-    query = update.callback_query
-    await query.answer()
-    parts      = query.data.split("_")
-    rating_val = int(parts[1])
-    order_id   = int(parts[2])
-    user_id    = query.from_user.id
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT id FROM ratings WHERE user_id=%s AND order_id=%s", (user_id, order_id))
-        if c.fetchone():
-            await query.edit_message_text("✅ سبق وسجلت تقييمك لهذا الطلب. شكراً!")
-            c.close()
-            return
-        c.execute("INSERT INTO ratings (user_id, order_id, rating, timestamp) VALUES (%s, %s, %s, %s)",
-            (user_id, order_id, rating_val, get_pal_time()))
-        conn.commit()
-        c.close()
-    rating_labels = {5: "🌟 ممتاز وسريع، رائع!!", 4: "😊 كويس", 3: "😐 عادي", 2: "🐢 بطيء", 1: "😤 بصراحة مش نافع"}
-    await query.edit_message_text(f"شكراً على تقييمك! ❤️\nاخترت: {rating_labels.get(rating_val, '')}\nرأيك مهم لتحسين الخدمة. 🌸")
-
-async def admin_ratings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر /ratings — إحصائيات التقييمات للكاشير فقط"""
-    if update.message.chat_id != CASHIER_ID:
-        return
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*), AVG(rating) FROM ratings")
-        res = c.fetchone()
-        total_ratings = res[0] or 0
-        avg_rating    = res[1]
-        c.close()
-    if total_ratings == 0:
-        await update.message.reply_text("⭐ لا يوجد تقييمات حتى الآن.")
-        return
-    avg_str = f"{avg_rating:.1f}" if avg_rating else "—"
-    stars   = "⭐" * round(avg_rating) if avg_rating else ""
-    report = (f"📊 **إحصائيات التقييمات:**\n\n✨ متوسط التقييم: {avg_str} / 5  {stars}\n📝 عدد التقييمات: {total_ratings}")
-    await update.message.reply_text(report, parse_mode='Markdown')
-
-# ------------------------------------------------------------------
-# الكاشير والزبون — معالجة الطلبات
-# ------------------------------------------------------------------
-
-async def cashier_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != CASHIER_ID:
-        await query.answer("⛔ غير مصرح لك بهذا الإجراء.", show_alert=True)
-        return
-    data = query.data.split("_")
-    with get_db() as conn:
-        c = conn.cursor()
-        if data[0] == "conf":
-            user_id, order_id = int(data[1]), int(data[2])
-            c.execute("UPDATE orders SET status='مقبول' WHERE id=%s", (order_id,))
-            c.execute("SELECT details FROM orders WHERE id=%s", (order_id,))
-            details = c.fetchone()[0]
-            conn.commit()
-            await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد.")
-            user_final_text = f"✅ **تم تأكيد طلبك!**\n📦 {details}\n📝 تم إضافة الطلب على دفتر الدين.\nصحة وهنا! ❤️"
-            wait_msg_id = context.application.bot_data.get(f'wait_msg_{order_id}')
-            if wait_msg_id:
-                try:
-                    await context.bot.edit_message_text(chat_id=user_id, message_id=wait_msg_id, text=user_final_text, parse_mode='Markdown')
-                except Exception:
-                    await context.bot.send_message(chat_id=user_id, text=user_final_text, parse_mode='Markdown')
-            else:
-                await context.bot.send_message(chat_id=user_id, text=user_final_text, parse_mode='Markdown')
-            schedule_rating_request(context, user_id, order_id, delay_minutes=10)
-        elif data[0] == "out":
-            user_id, order_id = data[1], data[2]
-            c.execute("SELECT details FROM orders WHERE id=%s", (order_id,))
-            items = [it.strip() for it in c.fetchone()[0].split(",")]
-            keyboard = [[InlineKeyboardButton(f"❌ {it} غير متوفر", callback_data=f"rmv_{user_id}_{order_id}_{i}")] for i, it in enumerate(items)]
-            await query.edit_message_text(f"اختار الصنف الناقص في طلب #{order_id}:", reply_markup=InlineKeyboardMarkup(keyboard))
-        c.close()
-
-async def remove_item_from_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != CASHIER_ID:
-        await query.answer("⛔ غير مصرح لك بهذا الإجراء.", show_alert=True)
-        return
-    data = query.data.split("_")
-    user_id, order_id, item_idx = int(data[1]), int(data[2]), int(data[3])
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT details FROM orders WHERE id=%s", (order_id,))
-        items = [it.strip() for it in c.fetchone()[0].split(",")]
-        removed_item = items.pop(item_idx)
-        new_details = ", ".join(items)
-        new_total = sum(PRICES.get(it, 0) for it in items)
-        c.execute("UPDATE orders SET details=%s, total_price=%s, status='تعديل زبون' WHERE id=%s",
-                  (new_details, new_total, order_id))
-        conn.commit()
-        c.close()
-    await query.edit_message_text(f"⚠️ تم إبلاغ الزبون بنقص ({removed_item}).")
-    wait_msg_id = context.application.bot_data.get(f'wait_msg_{order_id}')
-    if wait_msg_id:
-        try: await context.bot.delete_message(chat_id=user_id, message_id=wait_msg_id)
-        except Exception: pass
-    keyboard = [
-        [InlineKeyboardButton("➕ إضافة أصناف بديلة", callback_data=f"editback_{order_id}")],
-        [InlineKeyboardButton("✅ إرسال الطلب المتبقي", callback_data=f"editready_{order_id}")]
-    ]
-    await context.bot.send_message(chat_id=user_id,
-        text=f"⚠️ عذراً، ({removed_item}) غير متوفر.\nسلتك الحالية: {new_details}\n\nحابب تضيف بديل ولا نعتمد هيك؟",
-        reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def customer_handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data.split("_")
-    action, order_id = data[0], int(data[1])
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT details, location FROM orders WHERE id=%s", (order_id,))
-        res = c.fetchone()
-        c.close()
-    context.user_data['cart'] = [it.strip() for it in res[0].split(",")] if res[0] else []
-    context.user_data['editing_order_id'] = order_id
-    context.user_data['last_msg_id'] = query.message.message_id
-    if res[1] and "مكتب" in res[1]:
-        context.user_data['office'] = res[1]
-    if action == "editback":
-        return await show_categories(update, context)
-    else:
-        keyboard = [
-            [InlineKeyboardButton("توصيل للمكتب 🖥️", callback_data='loc_office')],
-            [InlineKeyboardButton("في الكوفي كورنر 🪑", callback_data='loc_place')]
-        ]
-        await query.edit_message_text("تأكيد مكان الاستلام:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return LOCATION_TYPE
-
 async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != CASHIER_ID:
         return
@@ -661,7 +579,11 @@ async def admin_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute("SELECT user_id, location, SUM(total_price) FROM orders WHERE is_paid = 0 AND status = 'مقبول' AND location != 'دفع فوري' GROUP BY user_id, location")
         debtors = c.fetchall()
         c.close()
-    report = (f"📔 **دفتر الحسابات (آخر 7 أيام):**\n📦 إجمالي الطلبات: {total_orders} حركة\n💰 المبيعات الكلية: {total_sales} شيكل\n⚡ إجمالي الدفع الفوري: {instant_paid} شيكل\n🔴 إجمالي الديون المعلقة: {total_debts} شيكل\n\n")
+    report = (f"📔 **دفتر الحسابات (آخر 7 أيام):**\n"
+              f"📦 إجمالي الطلبات: {total_orders} حركة\n"
+              f"💰 المبيعات الكلية: {total_sales} شيكل\n"
+              f"⚡ إجمالي الدفع الفوري: {instant_paid} شيكل\n"
+              f"🔴 إجمالي الديون المعلقة: {total_debts} شيكل\n\n")
     keyboard = [[InlineKeyboardButton(f"🔔 {d[1]} ({d[2]} ش)", callback_data=f"remind_{d[0]}_{d[2]}")] for d in debtors]
     if not keyboard:
         report += "✨ لا يوجد ديون معلقة حالياً."
@@ -700,6 +622,79 @@ async def clear_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     await context.bot.send_message(chat_id=user_id, text="✅ تم تأكيد استلام المبلغ وتصفير حسابك بنجاح. شكراً لك!")
 
+# ------------------------------------------------------------------
+# نظام التقييم
+# ------------------------------------------------------------------
+
+async def _send_rating_job(context: ContextTypes.DEFAULT_TYPE):
+    user_id  = context.job.data['user_id']
+    order_id = context.job.data['order_id']
+    keyboard = [
+        [InlineKeyboardButton("🌟 ممتاز وسريع، رائع!!", callback_data=f"rate_5_{order_id}")],
+        [InlineKeyboardButton("😊 كويس",               callback_data=f"rate_4_{order_id}")],
+        [InlineKeyboardButton("😐 عادي",               callback_data=f"rate_3_{order_id}")],
+        [InlineKeyboardButton("🐢 بطيء",               callback_data=f"rate_2_{order_id}")],
+        [InlineKeyboardButton("😤 بصراحة مش نافع",    callback_data=f"rate_1_{order_id}")]
+    ]
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"⭐ كيف كانت تجربتك في هذه العملية؟\nطلب #{order_id}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.warning(f"تعذر إرسال طلب التقييم للمستخدم {user_id}: {e}")
+
+def schedule_rating_request(context: ContextTypes.DEFAULT_TYPE, user_id: int, order_id: int, delay_minutes: int = 10):
+    if context.application.job_queue is None:
+        logger.warning("job_queue غير مفعّل.")
+        return
+    context.application.job_queue.run_once(
+        _send_rating_job,
+        when=delay_minutes * 60,
+        data={'user_id': user_id, 'order_id': order_id},
+        name=f"rating_{order_id}"
+    )
+
+async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts      = query.data.split("_")
+    rating_val = int(parts[1])
+    order_id   = int(parts[2])
+    user_id    = query.from_user.id
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM ratings WHERE user_id=%s AND order_id=%s", (user_id, order_id))
+        if c.fetchone():
+            await query.edit_message_text("✅ سبق وسجلت تقييمك لهذا الطلب. شكراً!")
+            c.close()
+            return
+        c.execute("INSERT INTO ratings (user_id, order_id, rating, timestamp) VALUES (%s, %s, %s, %s)",
+            (user_id, order_id, rating_val, get_pal_time()))
+        conn.commit()
+        c.close()
+    rating_labels = {5: "🌟 ممتاز وسريع، رائع!!", 4: "😊 كويس", 3: "😐 عادي", 2: "🐢 بطيء", 1: "😤 بصراحة مش نافع"}
+    await query.edit_message_text(f"شكراً على تقييمك! ❤️\nاخترت: {rating_labels.get(rating_val, '')}\nرأيك مهم لتحسين الخدمة. 🌸")
+
+async def admin_ratings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id != CASHIER_ID:
+        return
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), AVG(rating) FROM ratings")
+        res = c.fetchone()
+        total_ratings = res[0] or 0
+        avg_rating    = res[1]
+        c.close()
+    if total_ratings == 0:
+        await update.message.reply_text("⭐ لا يوجد تقييمات حتى الآن.")
+        return
+    avg_str = f"{avg_rating:.1f}" if avg_rating else "—"
+    stars   = "⭐" * round(avg_rating) if avg_rating else ""
+    report = (f"📊 **إحصائيات التقييمات:**\n\n✨ متوسط التقييم: {avg_str} / 5  {stars}\n📝 عدد التقييمات: {total_ratings}")
+    await update.message.reply_text(report, parse_mode='Markdown')
+
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "الرجاء الضغط على زر **البدء (Start)** في الأسفل، أو استخدام **القائمة (الزر الأزرق ☰)** بالجانب لخيارات البدء."
     await update.message.reply_text(text, parse_mode='Markdown')
@@ -734,7 +729,6 @@ def main():
             CommandHandler('pay', start_instant_pay),
             CallbackQueryHandler(customer_handle_edit, pattern="^edit(back|ready)_"),
             CallbackQueryHandler(settle_start, pattern="^settle_"),
-            # التقاط النصوص المكتوبة خارج الأوامر وإرسالها للذكاء الاصطناعي
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_order)
         ],
         states={
