@@ -181,7 +181,10 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         error_msg = str(e).lower()
-        await wait_msg.delete()
+        try:
+            await wait_msg.delete()
+        except:
+            pass
         
         if any(x in error_msg for x in ["429", "quota", "limit", "exhausted"]):
             await update.message.reply_text("🤖 المساعد الذكي مشغول حالياً! تفضل المنيو السريع لخدمتك فوراً 👇")
@@ -189,7 +192,9 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         logger.error(f"Gemini Error: {e}")
         error_type = "الصوتي" if is_voice else "نصياً"
-        await update.message.reply_text(f"⚠️ المعذرة، لم أتمكن من معالجة الطلب {error_type}. الرجاء استخدام الأزرار 👇")
+        
+        # السطرين هذول رح يبعتولك تفاصيل المشكلة التقنية بالضبط
+        await update.message.reply_text(f"⚠️ خطأ في معالجة الطلب {error_type}:\n`{str(e)}`", parse_mode='Markdown')
         return await show_categories(update, context)
 
 # ------------------------------------------------------------------
