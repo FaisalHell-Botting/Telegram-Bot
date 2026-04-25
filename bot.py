@@ -99,23 +99,28 @@ async def show_cart_ui(update: Update, context: ContextTypes.DEFAULT_TYPE, base_
     return CONFIRMING_CART
 
 # ------------------------------------------------------------------
-# ===== ذكاء اصطناعي: التقاط الطلب الحر عبر Gemini مع تدوير المفاتيح =====
+# ===== ذكاء اصطناعي: التقاط الطلب الحر (صوت + نص) مع تدوير المفاتيح =====
 # ------------------------------------------------------------------
 async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.strip()
+    is_voice = bool(update.message.voice)
+    user_text = update.message.text.strip() if update.message.text else ""
     
-    if len(user_text) < 3 or not GEMINI_KEYS:
+    # التحقق: إذا كان نصاً، هل هو طويل كفاية؟ (الصوت دائماً يتم معالجته)
+    if not is_voice and (len(user_text) < 3 or not GEMINI_KEYS):
         await unknown_text(update, context)
         return ConversationHandler.END
 
-    wait_msg = await update.message.reply_text("🤖 جاري فهم طلبك...")
+    if is_voice:
+        wait_msg = await update.message.reply_text("🤖 جاري الاستماع لطلبك...")
+    else:
+        wait_msg = await update.message.reply_text("🤖 جاري فهم طلبك...")
 
     try:
         genai.configure(api_key=random.choice(GEMINI_KEYS))
-        
         model = genai.GenerativeModel('gemini-2.5-flash')
+        
         prompt = f"""
-        أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من رسالة الزبون التالية: '{user_text}'
+        أنت كاشير ذكي لكوفي كورنر. استخرج الطلب من الرسالة (سواء كانت صوتية أو نصية).
         قائمة الأصناف المتاحة حرفياً: {list(PRICES.keys())}
         القواعد:
         1. طابق الأصناف مع القائمة المتاحة فقط بناءً على أقرب معنى.
@@ -127,7 +132,21 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         تحذير: لا تقم بإضافة أي نصوص أو علامات Markdown مثل ```json حول الرد.
         """
         
-        response = await model.generate_content_async(prompt)
+        contents = [prompt]
+        
+        # معالجة الصوت أو النص
+        if is_voice:
+            # تحميل الملف الصوتي إلى الذاكرة المؤقتة (Bytes) بدون حفظه على السيرفر
+            voice_file = await update.message.voice.get_file()
+            audio_bytes = await voice_file.download_as_bytearray()
+            contents.append({
+                "mime_type": "audio/ogg",
+                "data": audio_bytes
+            })
+        else:
+            contents.append(f"الطلب النصي: '{user_text}'")
+
+        response = await model.generate_content_async(contents)
         clean_text = response.text.replace('```json', '').replace('```', '').strip()
         data = json.loads(clean_text)
 
@@ -169,7 +188,8 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await show_categories(update, context)
         
         logger.error(f"Gemini Error: {e}")
-        await update.message.reply_text("⚠️ المعذرة، لم أتمكن من معالجة الطلب نصياً. الرجاء استخدام الأزرار 👇")
+        error_type = "الصوتي" if is_voice else "نصياً"
+        await update.message.reply_text(f"⚠️ المعذرة، لم أتمكن من معالجة الطلب {error_type}. الرجاء استخدام الأزرار 👇")
         return await show_categories(update, context)
 
 # ------------------------------------------------------------------
@@ -187,13 +207,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_old_message(update, context)
     context.user_data.clear()
     context.user_data['cart'] = []
-    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(أو يمكنك كتابة طلبك مباشرة، مثلاً: بدي 2 قهوة وسط لمكتب 15)*"
+    text = "يسعد أوقاتك! ☕\nللاستمتاع بتجربة صحيحة، يرجى كتابة **رقم مكتبك**:\n\n*(أو يمكنك إرسال بصمة صوتية أو نص بطلبك مباشرة، مثلاً: بدي 2 قهوة وسط لمكتب 15)*"
     if update.message:
         msg = await update.message.reply_text(text, parse_mode='Markdown')
         context.user_data['last_msg_id'] = msg.message_id
     return ASK_OFFICE
 
 async def save_office_and_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # إذا أرسل المستخدم رسالة صوتية في هذه المرحلة، نوجهها للذكاء الاصطناعي
+    if update.message.voice:
+        return await handle_ai_order(update, context)
+        
     user_text = update.message.text.strip()
     
     if len(user_text) > 15 or "بدي" in user_text:
@@ -729,10 +753,12 @@ def main():
             CommandHandler('pay', start_instant_pay),
             CallbackQueryHandler(customer_handle_edit, pattern="^edit(back|ready)_"),
             CallbackQueryHandler(settle_start, pattern="^settle_"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_order)
+            # تعديل هنا: دمج filters.VOICE لالتقاط البصمات الصوتية بالإضافة للنصوص
+            MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, handle_ai_order)
         ],
         states={
-            ASK_OFFICE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, save_office_and_show_menu)],
+            # وتعديل هنا أيضاً لالتقاط الصوت إذا أرسله المستخدم وهو يختار رقم المكتب
+            ASK_OFFICE:        [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, save_office_and_show_menu)],
             CHOOSING_CATEGORY: [CallbackQueryHandler(category_choice, pattern="^cat_")],
             CHOOSING_SERVICE:  [CallbackQueryHandler(service_choice,  pattern="^(item_|back_to_main$)")],
             CONFIRMING_CART:   [CallbackQueryHandler(confirm_cart,    pattern=r"^(remove_\d+|add_more|confirm_order|cancel_order)$")],
@@ -768,7 +794,7 @@ def main():
     app.add_handler(CallbackQueryHandler(send_reminder, pattern="^remind_"))
     app.add_handler(CallbackQueryHandler(clear_debt,    pattern="^clear_"))
     
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
+    app.add_handler(MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, unknown_text))
 
     app.run_webhook(
         listen="0.0.0.0",
