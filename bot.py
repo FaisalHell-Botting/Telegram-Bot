@@ -136,12 +136,12 @@ async def handle_ai_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # معالجة الصوت أو النص
         if is_voice:
-            # تحميل الملف الصوتي إلى الذاكرة المؤقتة (Bytes) بدون حفظه على السيرفر
+            # تحميل الملف الصوتي إلى الذاكرة المؤقتة وتحويله لـ bytes
             voice_file = await update.message.voice.get_file()
-            audio_bytes = await voice_file.download_as_bytearray()
+            audio_bytearray = await voice_file.download_as_bytearray()
             contents.append({
                 "mime_type": "audio/ogg",
-                "data": audio_bytes
+                "data": bytes(audio_bytearray) # التعديل السحري هنا
             })
         else:
             contents.append(f"الطلب النصي: '{user_text}'")
