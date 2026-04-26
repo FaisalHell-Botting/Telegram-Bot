@@ -14,8 +14,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 # --- الإعدادات ---
 TOKEN = os.environ.get('BOT_TOKEN', '8705243157:AAEvgDT3PecE8fmwc962NnToHnJl2xpFhAQ')
-CASHIER_ID = int(os.environ.get('CASHIER_ID', 7447129659))
-OLD_CASHIER_ID = 5312266808
+CASHIER_ID = int(os.environ.get('CASHIER_ID', 5312266808))
+OLD_CASHIER_ID = 7447129659
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 WEBHOOK_DOMAIN = "https://lego-food-bot.onrender.com"
